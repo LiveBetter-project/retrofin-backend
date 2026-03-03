@@ -1,11 +1,24 @@
 from django.contrib import admin
-from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User
+from django.contrib.auth import get_user_model
+from main.models import Experiment, Building
+
+User = get_user_model()
 
 
 @admin.register(User)
-class UserAdmin(BaseUserAdmin):
-    list_display = ['username', 'email', 'first_name', 'last_name', 'is_staff', 'created_at']
-    list_filter = ['is_staff', 'is_superuser', 'is_active', 'created_at']
-    search_fields = ['username', 'email', 'first_name', 'last_name']
-    ordering = ['-created_at']
+class UserAdmin(admin.ModelAdmin):
+    list_display = ("id", "username", "email", "is_staff", "is_active", "created_at")
+    search_fields = ("username", "email")
+
+
+@admin.register(Experiment)
+class ExperimentAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "user", "status", "created_at")
+    list_filter = ("status",)
+    search_fields = ("id", "name", "user__username")
+
+
+@admin.register(Building)
+class BuildingAdmin(admin.ModelAdmin):
+    list_display = ("id", "name", "experiment", "country", "year_of_construction", "floor_area", "created_at")
+    search_fields = ("id", "name", "experiment__id")
