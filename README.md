@@ -1,0 +1,1 @@
+If you're developing on windows, be sure to change the end-of-line in scripts `entrypoint.sh` and `Dockerfile` from **CRLF** to **LF**.
