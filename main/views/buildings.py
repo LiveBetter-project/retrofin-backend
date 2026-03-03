@@ -7,7 +7,7 @@ from main.serializers import BuildingSerializer
 
 class BuildingViewSet(viewsets.ModelViewSet):
     """
-    /api/v1/experiments/{experimentId}/buildings
+    /api/experiments/{experimentId}/buildings
     """
     serializer_class = BuildingSerializer
 

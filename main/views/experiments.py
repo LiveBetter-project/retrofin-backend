@@ -8,7 +8,7 @@ from main.serializers import ExperimentSerializer, ExperimentUpdateSerializer
 
 class ExperimentViewSet(viewsets.ModelViewSet):
     """
-    /api/v1/experiments
+    /api/experiments
     """
     serializer_class = ExperimentSerializer
 
