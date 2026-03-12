@@ -5,7 +5,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from rest_framework import serializers
 
-from main.models import Experiment, Building
+from main.models import Experiment, Building, Run
 
 User = get_user_model()
 
@@ -65,14 +65,22 @@ class RefreshTokenSerializer(serializers.Serializer):
 
 class ExperimentSerializer(serializers.ModelSerializer):
     last_run = serializers.SerializerMethodField()
+    # name is optional on creation – create() will generate a default when omitted or blank
+    name = serializers.CharField(required=False, allow_blank=True, allow_null=True, default=None)
 
     class Meta:
         model = Experiment
         fields = ["id", "name", "created_at", "status", "last_run"]
 
     def get_last_run(self, obj):
-        # v1: runs model not implemented yet
-        return None
+        last = obj.runs.order_by("-started_at").first()
+        if last is None:
+            return None
+        return {
+            "run_id": last.id,
+            "status": last.status,
+            "finished_at": last.finished_at,
+        }
 
     def validate_name(self, value):
         if value is None:
@@ -109,7 +117,7 @@ class BuildingSerializer(serializers.ModelSerializer):
         model = Building
         fields = [
             "id",
-            "experiment",
+            "experiment_id",
             "name",
             "country",
             "region",
@@ -120,7 +128,7 @@ class BuildingSerializer(serializers.ModelSerializer):
             "eem_maintenance_cost",
             "eem_lifetime",
         ]
-        read_only_fields = ["id", "experiment"]
+        read_only_fields = ["id", "experiment_id"]
 
     def validate_country(self, value):
         v = (value or "").strip().upper()
@@ -129,9 +137,8 @@ class BuildingSerializer(serializers.ModelSerializer):
         return v
 
     def validate_eem_energy_savings(self, value):
-        # Decimal comes in as Decimal; comparisons are fine
-        if value < 0 or value > 1:
-            raise serializers.ValidationError("eem_energy_savings must be between 0 and 1.")
+        if value < 0:
+            raise serializers.ValidationError("eem_energy_savings must be non-negative.")
         return value
 
     def validate_year_of_construction(self, value):
