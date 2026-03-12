@@ -1,8 +1,9 @@
 from django.utils import timezone
 from rest_framework import viewsets, status
+from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from main.models import Experiment
+from main.models import Experiment, Run
 from main.serializers import ExperimentSerializer, ExperimentUpdateSerializer
 
 
@@ -38,3 +39,38 @@ class ExperimentViewSet(viewsets.ModelViewSet):
         serializer.save()
         # Return full experiment shape
         return Response(ExperimentSerializer(instance).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["get"], url_path="readiness")
+    def readiness(self, request, pk=None):
+        experiment = self.get_object()
+        missing = []
+        if not experiment.buildings.exists():
+            missing.append({"path": "buildings", "message": "At least one building is required."})
+        if not experiment.schemes.exists():
+            missing.append({"path": "financing_schemes", "message": "Select at least one financing scheme."})
+        return Response({"is_ready": len(missing) == 0, "missing": missing})
+
+    @action(detail=True, methods=["post"], url_path="run")
+    def run(self, request, pk=None):
+        experiment = self.get_object()
+
+        # Readiness guard
+        missing = []
+        if not experiment.buildings.exists():
+            missing.append({"path": "buildings", "message": "At least one building is required."})
+        if not experiment.schemes.exists():
+            missing.append({"path": "financing_schemes", "message": "Select at least one financing scheme."})
+        if missing:
+            return Response(
+                {"error": {"code": "NOT_READY", "message": "Experiment is not ready to run.", "details": missing}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        run = Run.objects.create(experiment=experiment)
+        experiment.status = Experiment.Status.RUNNING
+        experiment.save(update_fields=["status", "updated_at"])
+
+        return Response(
+            {"run_id": run.id, "status": run.status, "started_at": run.started_at},
+            status=status.HTTP_201_CREATED,
+        )
