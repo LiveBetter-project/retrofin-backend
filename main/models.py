@@ -11,6 +11,14 @@ def generate_building_id():
     return "bld_" + secrets.token_hex(8)
 
 
+def generate_scheme_id():
+    return "fs_" + secrets.token_hex(8)
+
+
+def generate_run_id():
+    return "run_" + secrets.token_hex(8)
+
+
 class User(AbstractUser):
     email = models.EmailField(unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -65,7 +73,7 @@ class Building(models.Model):
 
     # v1 aggregated EEM fields embedded in Building
     eem_capex = models.DecimalField(max_digits=14, decimal_places=2)
-    eem_energy_savings = models.DecimalField(max_digits=7, decimal_places=4)  # 0..1
+    eem_energy_savings = models.DecimalField(max_digits=14, decimal_places=2)  # annual kWh
     eem_maintenance_cost = models.DecimalField(max_digits=14, decimal_places=2)
     eem_lifetime = models.PositiveIntegerField()
 
@@ -97,10 +105,11 @@ class Scheme(models.Model):
         ON_BILL = "on_bill", "On-Bill Financing"
         OPERATIONAL_LEASE = "operational_lease", "Operational Lease"
 
-    id = models.CharField(primary_key=True)
+    id = models.CharField(primary_key=True, max_length=32, default=generate_scheme_id, editable=False)
     experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name="schemes")
     scheme_type = models.CharField(max_length=100, choices=SchemeType.choices)
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "schemes"
@@ -113,78 +122,78 @@ class SchemeEquity(models.Model):
 
 class SchemeBankLoan(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="bank_loan")
-    loan_amount = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
+    loan_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
 
     class Meta:
         db_table = "scheme_bank_loan"
 
 class SchemeEquityCrowdfunding(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="equity_crowdfunding")
-    platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4)
-    crowd_share_percent = models.DecimalField(max_digits=6, decimal_places=4)
-    
+    platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    crowd_share_percent = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+
     class Meta:
         db_table = "scheme_equity_crowdfunding"
 
 class SchemeLendingCrowdfunding(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="lending_crowdfunding")
-    platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4)
-    loan_amount = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
-    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4)
-    
+    platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    loan_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
+    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+
     class Meta:
         db_table = "scheme_lending_crowdfunding"
 
 class SchemeRoyaltyCrowdfunding(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="royalty_crowdfunding")
-    platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4)
-    loan_amount = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
-    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4)
-    
+    platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    loan_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
+    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+
     class Meta:
         db_table = "scheme_royalty_crowdfunding"
 
 class SchemeEPCFirstOut(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="epc_first_out")
-    
+
     class Meta:
         db_table = "scheme_epc_first_out"
 
 class SchemeEPCSharedSavings(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="epc_shared_savings")
-    esco_fee_percent = models.DecimalField(max_digits=6, decimal_places=4)
-    term_years = models.IntegerField()
+    esco_fee_percent = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
 
     class Meta:
         db_table = "scheme_epc_shared_savings"
 
 class SchemeEPCGuaranteedSavings(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="epc_guaranteed_savings")
-    guaranteed_savings_amount = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
+    guaranteed_savings_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
 
     class Meta:
         db_table = "scheme_epc_guaranteed_savings"
 
 class SchemeGreenBondLoan(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="green_bond_loan")
-    loan_amount = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
-    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4)
-    maintenance_cost = models.DecimalField(max_digits=14, decimal_places=2)
+    loan_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
+    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    maintenance_cost = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "scheme_green_bond_loan"
 
 class SchemeGreenBondBullet(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="green_bond_bullet")
-    loan_amount = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
-    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4)
-    maintenance_cost = models.DecimalField(max_digits=14, decimal_places=2)
+    loan_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
+    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    maintenance_cost = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "scheme_green_bond_bullet"
@@ -192,19 +201,41 @@ class SchemeGreenBondBullet(models.Model):
 
 class SchemeOnBill(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="on_bill")
-    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4)
-    term_years = models.IntegerField()
+    fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
 
     class Meta:
         db_table = "scheme_on_bill"
 
 class SchemeOperationalLease(models.Model):
     scheme = models.OneToOneField(Scheme, on_delete=models.CASCADE, related_name="operational_lease")
-    lease_payment = models.DecimalField(max_digits=15, decimal_places=2)
-    term_years = models.IntegerField()
+    lease_payment = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
+    term_years = models.IntegerField(null=True, blank=True)
 
     class Meta:
         db_table = "scheme_operational_lease"
+
+class Run(models.Model):
+    class Status(models.TextChoices):
+        RUNNING = "running", "Running"
+        COMPLETED = "completed", "Completed"
+        FAILED = "failed", "Failed"
+
+    id = models.CharField(primary_key=True, max_length=32, default=generate_run_id, editable=False)
+    experiment = models.ForeignKey(Experiment, on_delete=models.CASCADE, related_name="runs")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.RUNNING)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "runs"
+        indexes = [
+            models.Index(fields=["experiment", "-started_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.id} ({self.status})"
+
 
 class SchemeResult(models.Model):
     id = models.CharField(primary_key=True, max_length=32, editable=False)
