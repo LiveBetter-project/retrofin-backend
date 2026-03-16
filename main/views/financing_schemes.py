@@ -3,6 +3,7 @@ from decimal import Decimal, InvalidOperation
 from django.db.models import Min
 from django.shortcuts import get_object_or_404
 from rest_framework import status, viewsets
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
 from main.models import (
@@ -269,6 +270,7 @@ class FinancingSchemeCatalogViewSet(viewsets.ViewSet):
     Read-only catalog of available financing scheme types.
     No authentication required (public reference data).
     """
+    permission_classes = [AllowAny]
 
     def list(self, request):
         items = [
@@ -296,6 +298,7 @@ class ExperimentSchemesViewSet(viewsets.ViewSet):
     CRUD for financing scheme instances attached to an experiment.
     Supports: list, create, partial_update, destroy.
     """
+    permission_classes = [IsAuthenticated]
 
     def _get_experiment(self, request, experiment_id):
         return get_object_or_404(Experiment, id=experiment_id, user=request.user)

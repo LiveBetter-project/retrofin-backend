@@ -1,6 +1,7 @@
 from django.utils import timezone
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from main.models import Experiment, Run
@@ -11,6 +12,7 @@ class ExperimentViewSet(viewsets.ModelViewSet):
     """
     /api/experiments
     """
+    permission_classes = [IsAuthenticated]
     serializer_class = ExperimentSerializer
 
     def get_queryset(self):
