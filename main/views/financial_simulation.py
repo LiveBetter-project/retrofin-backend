@@ -1,0 +1,1649 @@
+from rest_framework import viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from rest_framework import viewsets, status
+from main.models import *
+from django.contrib.auth import get_user_model
+import numpy as np
+import numpy_financial as npf
+import itertools
+import math
+import matplotlib.pyplot as plt
+from decimal import Decimal
+from django.utils import timezone
+import logging
+from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
+
+
+class FinancialSimulationError(Exception):
+    """Base exception for financial simulation failures."""
+
+
+class ExperimentConfigurationError(FinancialSimulationError):
+    """Raised when the experiment configuration is incomplete or invalid."""
+
+
+class FinancialInputError(FinancialSimulationError):
+    """Raised when required numerical inputs are missing or invalid."""
+
+
+class SchemeConfigurationError(FinancialSimulationError):
+    """Raised when a financing scheme is missing required details."""
+
+
+class SimulationComputationError(FinancialSimulationError):
+    """Raised when KPI or cash-flow computation fails."""
+
+
+class ResultPersistenceError(FinancialSimulationError):
+    """Raised when simulation results cannot be saved."""
+
+
+def _ensure(condition: bool, message: str, exc_type: type[Exception] = FinancialInputError) -> None:
+    if not condition:
+        raise exc_type(message)
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(numeric)
+
+
+def _validate_finite_number(name: str, value: Any, allow_none: bool = False) -> None:
+    if value is None and allow_none:
+        return
+    _ensure(_is_finite_number(value), f"{name} must be a finite number. Got: {value!r}")
+
+
+def _validate_non_negative_integer(name: str, value: Any, *, allow_zero: bool = True) -> int:
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        raise FinancialInputError(f"{name} must be an integer. Got: {value!r}")
+
+    if allow_zero:
+        _ensure(ivalue >= 0, f"{name} must be >= 0. Got: {ivalue}")
+    else:
+        _ensure(ivalue > 0, f"{name} must be > 0. Got: {ivalue}")
+    return ivalue
+
+
+def _validate_series(name: str, values: Any, required_length: int) -> None:
+    _ensure(isinstance(values, list), f"{name} must be a list. Got: {type(values).__name__}")
+    _ensure(len(values) >= required_length, f"{name} must contain at least {required_length} values. Got: {len(values)}")
+    for idx, value in enumerate(values[:required_length]):
+        _ensure(_is_finite_number(value), f"{name}[{idx}] must be a finite number. Got: {value!r}")
+
+
+def _validate_flows(flows: Any, *, require_initial_outflow: bool = False) -> None:
+    _ensure(isinstance(flows, list), f"Cash-flow function must return a list. Got: {type(flows).__name__}", SimulationComputationError)
+    _ensure(len(flows) >= 2, f"Cash-flow list must contain at least 2 values. Got: {len(flows)}", SimulationComputationError)
+    for idx, value in enumerate(flows):
+        _ensure(_is_finite_number(value), f"Cash-flow at index {idx} must be finite. Got: {value!r}", SimulationComputationError)
+    if require_initial_outflow:
+        _ensure(float(flows[0]) < 0, f"Initial cash-flow must be negative for this KPI calculation. Got: {flows[0]!r}", SimulationComputationError)
+
+
+def _validate_scheme_details(scheme: Any, attr_name: str):
+    details = getattr(scheme, attr_name, None)
+    _ensure(details is not None, f"Scheme '{scheme.scheme_type}' is missing required '{attr_name}' details.", SchemeConfigurationError)
+    return details
+
+
+def _wrap_builder_error(scheme: Any, exc: Exception) -> SchemeConfigurationError:
+    return SchemeConfigurationError(
+        f"Failed to prepare inputs for scheme '{getattr(scheme, 'scheme_type', 'unknown')}': {exc}"
+    )
+
+def _to_decimal_or_none(value):
+    if value is None:
+        return None
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if math.isnan(value) or math.isinf(value):
+        return None
+
+    return Decimal(str(value))
+
+
+def save_scheme_results(experiment, results: dict, run=None):
+    building = experiment.buildings.first()
+    if building is None:
+        raise ExperimentConfigurationError("Cannot save scheme results because the experiment has no building.")
+    _ensure(isinstance(results, dict), f"results must be a dictionary. Got: {type(results).__name__}", ResultPersistenceError)
+
+    saved = []
+    logger.info("Saving scheme results for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
+    for scheme in experiment.schemes.all():
+        scheme_result = results.get(scheme.scheme_type)
+        if not scheme_result:
+            continue
+
+        try:
+            summary = scheme_result.get("summary", {})
+            percentiles = summary.get("percentiles", {})
+            probabilities = summary.get("probabilities", {})
+
+            irr = percentiles.get("IRR", {})
+            npv = percentiles.get("NPV", {})
+            pbp = percentiles.get("PBP", {})
+            dpp = percentiles.get("DPP", {})
+            roi = percentiles.get("ROI", {})
+
+            obj, _ = SchemeResult.objects.update_or_create(
+                run=run,
+                scheme=scheme,
+                building=building,
+                defaults={
+                    "irr_p5": _to_decimal_or_none(irr.get("P5")),
+                    "irr_p10": _to_decimal_or_none(irr.get("P10")),
+                    "irr_p25": _to_decimal_or_none(irr.get("P25")),
+                    "irr_p50": _to_decimal_or_none(irr.get("P50")),
+                    "irr_p75": _to_decimal_or_none(irr.get("P75")),
+                    "irr_p90": _to_decimal_or_none(irr.get("P90")),
+                    "irr_p95": _to_decimal_or_none(irr.get("P95")),
+
+                    "npv_p5": _to_decimal_or_none(npv.get("P5")),
+                    "npv_p10": _to_decimal_or_none(npv.get("P10")),
+                    "npv_p25": _to_decimal_or_none(npv.get("P25")),
+                    "npv_p50": _to_decimal_or_none(npv.get("P50")),
+                    "npv_p75": _to_decimal_or_none(npv.get("P75")),
+                    "npv_p90": _to_decimal_or_none(npv.get("P90")),
+                    "npv_p95": _to_decimal_or_none(npv.get("P95")),
+
+                    "pbp_p5": _to_decimal_or_none(pbp.get("P5")),
+                    "pbp_p10": _to_decimal_or_none(pbp.get("P10")),
+                    "pbp_p25": _to_decimal_or_none(pbp.get("P25")),
+                    "pbp_p50": _to_decimal_or_none(pbp.get("P50")),
+                    "pbp_p75": _to_decimal_or_none(pbp.get("P75")),
+                    "pbp_p90": _to_decimal_or_none(pbp.get("P90")),
+                    "pbp_p95": _to_decimal_or_none(pbp.get("P95")),
+
+                    "dpp_p5": _to_decimal_or_none(dpp.get("P5")),
+                    "dpp_p10": _to_decimal_or_none(dpp.get("P10")),
+                    "dpp_p25": _to_decimal_or_none(dpp.get("P25")),
+                    "dpp_p50": _to_decimal_or_none(dpp.get("P50")),
+                    "dpp_p75": _to_decimal_or_none(dpp.get("P75")),
+                    "dpp_p90": _to_decimal_or_none(dpp.get("P90")),
+                    "dpp_p95": _to_decimal_or_none(dpp.get("P95")),
+
+                    "roi_p5": _to_decimal_or_none(roi.get("P5")),
+                    "roi_p10": _to_decimal_or_none(roi.get("P10")),
+                    "roi_p25": _to_decimal_or_none(roi.get("P25")),
+                    "roi_p50": _to_decimal_or_none(roi.get("P50")),
+                    "roi_p75": _to_decimal_or_none(roi.get("P75")),
+                    "roi_p90": _to_decimal_or_none(roi.get("P90")),
+                    "roi_p95": _to_decimal_or_none(roi.get("P95")),
+
+                    "pr_npv_positive": _to_decimal_or_none(probabilities.get("Pr(NPV > 0)")),
+                    "pr_pbp_within_lifetime": _to_decimal_or_none(
+                        probabilities.get(f"Pr(PBP < {building.eem_lifetime}y)")
+                    ),
+                    "pr_dpp_within_lifetime": _to_decimal_or_none(
+                        probabilities.get(f"Pr(DPP < {building.eem_lifetime}y)")
+                    ),
+                    "disc_target_used": _to_decimal_or_none(summary.get("disc_target_used")),
+                    "n_sims": summary.get("n_sims", 0),
+                },
+            )
+        except Exception as exc:
+            raise ResultPersistenceError(
+                f"Failed to save results for scheme '{scheme.scheme_type}': {exc}"
+            ) from exc
+        saved.append(obj)
+
+    return saved
+
+def cash_flows_operational_leasing(
+    annual_energy_savings: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    lease_payment: float,
+    term_years: int,
+) -> list[float]:
+    """Compute yearly net cash-flows for an **operational leasing** scheme.
+
+    Parameters
+    ----------
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    lease_payment : float
+        Fixed yearly lease payment.
+    term_years : int
+        Lease duration in *years*.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is ``0`` because the lessor
+        covers the initial CAPEX.
+    """
+    flows = []
+    # Year 0: lessor covers CAPEX
+    flows.append(0)
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        # Operating cash flow (lessee O&M assumed included in lease => OMt = 0)
+        revenue = annual_energy_savings * electricity_prices[idx]
+        op_cf = revenue
+
+        # Lease payment
+        if t <= term_years:
+            D_t = lease_payment
+        else:
+            D_t = 0.0
+        flows.append(op_cf - D_t)
+
+    return flows
+
+#interest is usually low
+def cash_flows_on_bill_financing(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    term_years: int,
+    fixed_interest: float,          # fixed predefined interest rate (e.g., 0.05 for 5%)
+) -> list[float]:
+    """Compute yearly net cash-flows for **on-bill financing**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure covered by the provider.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    term_years : int
+        Repayment tenor in *years*.
+    fixed_interest : float
+        Fixed annual interest rate expressed as a fraction.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is ``0`` because the provider
+        covers the initial CAPEX.
+    """
+    flows = []
+
+    # Year 0: provider covers 100% CAPEX
+    flows.append(0)
+
+    outstanding = capex
+    principal = capex / term_years if term_years > 0 else 0
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        revenue = annual_energy_savings * electricity_prices[idx]
+        op_cf = revenue - om_t
+
+        # On-bill charge (debt service)
+        if t <= term_years:
+            interest = outstanding * fixed_interest 
+            D_t = principal + interest
+            outstanding -= principal
+        else:
+            D_t = 0.0
+
+        flows.append(op_cf - D_t)
+
+    return flows
+
+def cash_flows_green_bond_loan(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    gb_proceeds: float,
+    term_years: int,
+    fixed_interest: float,         # fixed predefined interest rate (e.g., 0.05 for 5%)
+    OM_green: float,
+) -> list[float]:
+    """Compute yearly net cash-flows for a **green bond with amortising loan**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly base O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    gb_proceeds : float
+        Amount raised through the green bond at *t = 0*.
+    term_years : int
+        Repayment tenor in *years*.
+    fixed_interest : float
+        Fixed annual interest rate expressed as a fraction.
+    OM_green : float
+        Additional yearly O&M cost associated with the green bond structure.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is the residual equity outflow
+        after deducting green bond proceeds.
+    """
+    flows = []
+
+    flows.append(-(capex - gb_proceeds))
+
+    outstanding = gb_proceeds
+    principal = gb_proceeds / term_years
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        om_green_t = OM_green * cumulative_inflation
+        revenue = annual_energy_savings * electricity_prices[idx]
+        op_cf = revenue - (om_t + om_green_t)
+
+        # Debt service (constant principal)
+        if t <= term_years:
+            interest = outstanding * fixed_interest 
+            D_t = principal + interest
+            outstanding -= principal
+        else:
+            D_t = 0.0
+        flows.append(op_cf - D_t)
+
+    return flows
+
+def cash_flows_green_bond_bullet(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    gb_proceeds: float,
+    term_years: int,
+    fixed_interest: float,  # fixed predefined interest rate (e.g., 0.05 for 5%)
+    OM_green: float,
+) -> list[float]:
+    """Compute yearly net cash-flows for a **green bond with bullet repayment**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly base O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    gb_proceeds : float
+        Amount raised through the green bond at *t = 0*.
+    term_years : int
+        Bond maturity in *years*.
+    fixed_interest : float
+        Fixed annual interest rate expressed as a fraction.
+    OM_green : float
+        Additional yearly O&M cost associated with the green bond structure.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is the residual equity outflow
+        after deducting green bond proceeds.
+    """
+    flows = []
+    flows.append(-(capex - gb_proceeds))
+
+    outstanding = gb_proceeds  # bullet principal stays constant until maturity
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        om_green_t = OM_green * cumulative_inflation  # O&M for green bond
+        revenue = annual_energy_savings * electricity_prices[idx]
+        op_cf = revenue - (om_t + om_green_t)
+
+        # Bullet debt service
+        if t < term_years:
+            interest = outstanding * fixed_interest 
+            D_t = interest
+        elif t == term_years:
+            interest = outstanding * fixed_interest 
+            D_t = interest + outstanding
+            outstanding = 0.0
+        else:
+            D_t = 0.0
+
+        flows.append(op_cf - D_t)
+
+    return flows
+
+def cash_flows_epc_guaranteed_savings(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    loan_interest_rate: list[float],
+    term_years: int,
+    gs: float,
+) -> list[float]:
+    """Compute yearly net cash-flows for an **EPC guaranteed-savings** contract.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure financed through debt.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    loan_interest_rate : list[float]
+        Annual interest rate applicable per remaining principal.
+    term_years : int
+        Repayment tenor in *years*.
+    gs : float
+        Guaranteed yearly savings in monetary terms 
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is ``0`` because the client
+        makes no initial outlay.
+    """
+    flows = []
+    flows.append(0)
+    outstanding = capex
+    principal = capex / term_years if term_years > 0 else 0
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        gs_t = gs * cumulative_inflation
+        # Operating cash flow
+        AS_t = annual_energy_savings * electricity_prices[idx]
+        op_cf = AS_t - om_t
+        # Loan payment
+        if t <= term_years:
+            interest = outstanding * (loan_interest_rate[idx] / 100.0)
+            D_t = principal + interest
+            outstanding -= principal
+        else:
+            D_t = 0.0
+        # ESCO compensation
+        if AS_t < gs_t:
+            comp = gs_t - AS_t
+        else:
+            comp = 0.0
+        cf_t = op_cf - D_t + comp
+        flows.append(cf_t)
+
+    return flows
+
+# we alo need the number of years that the contract is active for and ESCO gets money
+def cash_flows_epc_shared_savings(
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    p_ESCO: float,          # % of savings paid to ESCO (e.g., 0.30 for 30%)
+    term_years: int,            # number of years contract is active
+) -> list[float]:
+    """Compute yearly net cash-flows for an **EPC shared-savings** contract.
+
+    Parameters
+    ----------
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    p_ESCO : float
+        Share of realised savings paid to the ESCO as a fraction.
+    term_years : int
+        Contract duration in *years* during which the ESCO receives its share.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is ``0`` because the ESCO
+        covers the initial CAPEX.
+    """
+    flows = [] 
+    flows.append(0)     # Year 0: ESCO covers entire CAPEX
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        AS_t = annual_energy_savings * electricity_prices[idx]
+        op_cf = AS_t - om_t
+        # ESCO performance charge
+        if t <= term_years:
+            D_t = AS_t * p_ESCO 
+        else:
+            D_t = 0.0
+        
+        flows.append(op_cf - D_t)  
+
+    return flows
+
+# makes sense as an ESCO (always good for client? what if maintance is higher that savings?):
+def cash_flows_first_out_contract(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+) -> list[float]:
+    """Compute yearly net cash-flows for a **first-out ESCO contract**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure initially covered by the ESCO.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry is ``0`` because the client
+        makes no initial outlay and savings first repay the ESCO investment.
+    """
+    flows = []
+    flows.append(0)  # Year 0: ESCO covers 100% of CAPEX, client pays nothing upfront
+    D_paid = 0.0
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        AS_t = annual_energy_savings * electricity_prices[idx]
+        op_cf = AS_t - om_t
+
+        remaining = capex - D_paid
+
+        if remaining <= 0:
+            D_t = 0.0
+        else:
+            payment_available = max(0.0, op_cf)         
+            D_t = min(payment_available, remaining)  
+            D_paid += D_t
+
+        cf_t = op_cf - D_t
+        flows.append(cf_t)
+
+    return flows
+
+def cash_flows_royalty_crowdfunding(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    loan_crowd: float,          # capital raised from crowd at t=0
+    royalty_rate: float,        # % of gross revenue paid to crowd as royalty (e.g., 0.10 for 10%)
+    term_years: int,                # number of years royalty is paid (must be <= project_lifetime)
+    fee_plat: float,            # platform success fee rate (e.g., 0.05 for 5%)
+) -> list[float]:
+    """Compute yearly net cash-flows for **royalty-based crowdfunding**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    loan_crowd : float
+        Capital raised from the crowd at *t = 0*.
+    royalty_rate : float
+        Percentage of gross revenue paid to the crowd.
+    term_years : int
+        Number of years during which royalties are paid.
+    fee_plat : float
+        Platform success fee rate expressed as a fraction.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry reflects crowdfunding proceeds,
+        platform fees and CAPEX.
+    """
+    flows = []
+
+    # Year 0
+    plat_cost = loan_crowd * fee_plat 
+    flows.append(loan_crowd - plat_cost - capex)
+    cumulative_inflation = 1.0
+
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        # Gross revenue (actual savings)
+        revenue = annual_energy_savings * electricity_prices[idx]
+
+        # Royalty payment to crowd (off the top)
+        if t <= term_years:
+            pay_crowd = revenue * (royalty_rate / 100.0)
+        else:
+            pay_crowd = 0.0
+
+        om_t = annual_maintenace_cost * cumulative_inflation
+        flows.append(revenue - pay_crowd - om_t)
+
+    return flows
+
+# the interest rate is usually fixed and agreed beforehand
+# acts like a loan through crowdfunding
+def cash_flows_lending_crowdfunding(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    loan_crowd: float,      # capital raised from crowd at t=0
+    fixed_interest: float,  # fixed predefined interest rate (e.g., 0.05 for 5%)
+    term_years: int,         # term of loan in *years* (must be at least 1)
+    fee_plat: float,        # platform success fee rate (e.g., 0.05 for 5%)
+) -> list[float]:
+    """Compute yearly net cash-flows for **lending-based crowdfunding**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    loan_crowd : float
+        Capital raised from the crowd at *t = 0*.
+    fixed_interest : float
+        Fixed annual interest rate expressed as a fraction.
+    term_years : int
+        Repayment tenor in *years*.
+    fee_plat : float
+        Platform success fee rate expressed as a fraction.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry reflects crowdfunding proceeds,
+        platform fees and CAPEX.
+    """
+    flows = []
+
+    # Year 0
+    plat_cost = loan_crowd * fee_plat 
+    flows.append(loan_crowd - plat_cost - capex)
+
+    # Fixed annual debt payment 
+    r = fixed_interest
+    if term_years > 0:
+        if r == 0:
+            debt_payment = loan_crowd / term_years
+        else:
+            debt_payment = loan_crowd * (r * (1 + r) ** term_years) / ((1 + r) ** term_years - 1)
+    else:
+        debt_payment = 0.0
+
+    cumulative_inflation = 1.0
+    for t in range(1, project_lifetime + 1):
+        idx = t - 1
+        cumulative_inflation *= (1 + inflation_rate[idx] / 100.0)
+        om_t = annual_maintenace_cost * cumulative_inflation
+        AS_t = annual_energy_savings * electricity_prices[idx]
+        op_cf = AS_t - om_t
+
+        # Debt service to crowd
+        if t <= term_years:
+            D_crowd = debt_payment
+        else:
+            D_crowd = 0.0
+        flows.append(op_cf - D_crowd)
+    
+    return flows
+
+# her investors have co-ownership of the project
+def cash_flows_equity_crowdfunding(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    equity_crowd: float,                # capital raised from crowd at t=0
+    share_crowd: float,                 # % of profits paid to crowd when positive (e.g., 0.5 for 50%)
+    fee_plat: float,                    # platform success fee rate (e.g., 0.05 for 5%)
+) -> list[float]:
+    """Compute yearly net cash-flows for **equity crowdfunding**.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years*.
+    electricity_prices : list[float]
+        Forecast grid prices for each year.
+    inflation_rate : list[float]
+        Inflation rates for each year.
+    equity_crowd : float
+        Equity capital raised from the crowd at *t = 0*.
+    share_crowd : float
+        Fraction of positive distributable cash-flow allocated to the crowd.
+    fee_plat : float
+        Platform success fee rate expressed as a fraction.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence where the first entry reflects crowdfunding proceeds,
+        platform fees and CAPEX.
+    """
+
+    try:
+        T = project_lifetime
+        flows = []
+        # Year 0
+        plat_cost = equity_crowd * fee_plat
+        cf0 = equity_crowd - plat_cost - capex
+        flows.append(cf0)
+
+        # Operating years
+        cumulative_infl = 1.0
+        for t in range(1, T + 1):
+            idx = t - 1
+
+            cumulative_infl *= (1.0 + inflation_rate[idx] / 100.0)
+            revenue = annual_energy_savings * electricity_prices[idx]
+            costs = annual_maintenace_cost * cumulative_infl
+            distributable_cf = revenue - costs
+            # Crowd dividend only if positive CF
+            if distributable_cf > 0:
+                esco_cf = distributable_cf * (1 - share_crowd)
+            else:
+                esco_cf = 0.0
+            flows.append(esco_cf)
+
+        return flows
+    except Exception as exc:
+        raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
+
+def cash_flows_with_loan(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    loan_amount: float,
+    loan_interest_rate: list[float],
+    term_years: int,
+) -> list[float]:
+    """Compute the yearly net cash-flow profile **including** debt service.
+
+    Parameters
+    ----------
+    capex : float
+        Up-front capital expenditure (positive number). The function treats this as
+        an *outflow* at *t = 0*.
+    annual_energy_savings : float
+        Nominal number of kWh saved per year.
+    annual_maintenace_cost : float
+        Nominal yearly O&M cost in today's money.
+    project_lifetime : int
+        Evaluation horizon in *years* (must be at least 1).
+    electricity_prices : list[float]
+        Forecast grid prices for each year **indexed the same as `inflation_rate`**.
+    inflation_rate : list[float]
+        Inflation rates for each year (indexed the same as `electricity_prices`).
+    loan_amount : float
+        Principal borrowed at *t = 0*.
+    loan_interest_rate : list[float]
+        Annual interest rate applicable **per remaining principal**.
+    term_years : int
+        Term of loan in *years* (must be at least 1).
+    Returns
+    -------
+    list[float]
+        Sequence of net cash-flows (index 0 … ``project_lifetime``).  The first
+        element is *negative* (the equity outflow) and subsequent entries may be
+        positive or negative depending on operating surplus and debt service.
+    """
+    try:
+        flows = []
+        
+        # capex minus the loan received
+        flows.append(-(capex-loan_amount))
+        
+        outstanding = loan_amount
+        constant_principal_payment = loan_amount / term_years if term_years > 0 else 0.0
+        cumulative_infl = 1.0
+
+        for year in range(0, project_lifetime):
+            cumulative_infl *= (1 + inflation_rate[year]/100.0)
+            operating_cf = annual_energy_savings * electricity_prices[year] - annual_maintenace_cost * cumulative_infl
+            loan_payment = 0.0
+            
+            if year < term_years and loan_amount > 0:
+                interest_payment = outstanding * (loan_interest_rate[year] / 100.0)
+                loan_payment = constant_principal_payment + interest_payment
+                outstanding -= constant_principal_payment  
+            
+            flows.append(operating_cf - loan_payment)
+        
+        return flows
+    except Exception as exc:
+        raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
+
+def cash_flows(
+    capex: float,
+    annual_energy_savings: float,
+    annual_maintenace_cost: float,
+    project_lifetime: int,
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+) -> list[float]:
+    """Compute yearly net cash-flows for an **equity-only** project.
+
+    This variant omits any debt-service considerations and is therefore a
+    simplified special-case of :func:`cash_flows_with_loan`.
+
+    Parameters
+    ----------
+    capex, annual_energy_savings, annual_maintenace_cost, project_lifetime,
+    electricity_prices, inflation_rate : see :func:`cash_flows_with_loan`.
+
+    Returns
+    -------
+    list[float]
+        Cash-flow sequence (first entry negative).
+    """
+    try:
+        flows = [-capex] # t = 0 equity investment
+        cumulative_infl = 1.0
+        for k in range(0, project_lifetime):
+            cumulative_infl *= (1 + inflation_rate[k]/100.0)
+            flow_k = annual_energy_savings * electricity_prices[k] - annual_maintenace_cost * cumulative_infl
+            flows.append(flow_k)
+        return flows
+    except Exception as exc:
+        raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
+
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    """Convert Decimal / int / None to float."""
+    if value is None:
+        return default
+    return float(value)
+
+
+def _build_context(experiment) -> dict[str, Any] | None:
+    """Extract shared building-level financial inputs from the first building."""
+    building = experiment.buildings.first()
+    if building is None:
+        return None
+
+    lifetime = _validate_non_negative_integer("building.eem_lifetime", building.eem_lifetime, allow_zero=False)
+    _validate_finite_number("building.eem_capex", building.eem_capex)
+    _validate_finite_number("building.eem_energy_savings", building.eem_energy_savings)
+    _validate_finite_number("building.eem_maintenance_cost", building.eem_maintenance_cost)
+
+    return {
+        "capex": _to_float(building.eem_capex),
+        "annual_energy_savings": _to_float(building.eem_energy_savings),
+        "annual_maintenace_cost": _to_float(building.eem_maintenance_cost),
+        "project_lifetime": lifetime,
+    }
+
+def _build_operational_lease_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "operational_lease")
+    return {
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "lease_payment": _to_float(details.lease_payment),
+        "term_years": int(details.term_years or 0),
+    }
+
+
+def _build_on_bill_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "on_bill")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "term_years": int(details.term_years or 0),
+        "fixed_interest": _to_float(details.fixed_interest_rate),
+    }
+
+
+def _build_green_bond_loan_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "green_bond_loan")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "gb_proceeds": _to_float(details.loan_amount),
+        "term_years": int(details.term_years or 0),
+        "fixed_interest": _to_float(details.fixed_interest_rate),
+        "OM_green": _to_float(details.maintenance_cost),
+    }
+
+
+def _build_green_bond_bullet_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "green_bond_bullet")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "gb_proceeds": _to_float(details.loan_amount),
+        "term_years": int(details.term_years or 0),
+        "fixed_interest": _to_float(details.fixed_interest_rate),
+        "OM_green": _to_float(details.maintenance_cost),
+    }
+
+
+def _build_epc_guaranteed_savings_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "epc_guaranteed_savings")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "loan_interest_rate": None,
+        "term_years": int(details.term_years or 0),
+        "gs": _to_float(details.guaranteed_savings_amount),
+    }
+
+
+def _build_epc_shared_savings_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "epc_shared_savings")
+    return {
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "p_ESCO": _to_float(details.esco_fee_percent),
+        "term_years": int(details.term_years or 0),
+    }
+
+
+def _build_epc_first_out_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+    }
+
+
+def _build_royalty_crowdfunding_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "royalty_crowdfunding")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "loan_crowd": _to_float(details.loan_amount),
+        "royalty_rate": _to_float(details.fixed_interest_rate),  #TODO: rename in model later
+        "term_years": int(details.term_years or 0),
+        "fee_plat": _to_float(details.platform_fee_percent),
+    }
+
+
+def _build_lending_crowdfunding_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "lending_crowdfunding")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "loan_crowd": _to_float(details.loan_amount),
+        "fixed_interest": _to_float(details.fixed_interest_rate),
+        "term_years": int(details.term_years or 0),
+        "fee_plat": _to_float(details.platform_fee_percent),
+    }
+
+
+def _build_equity_crowdfunding_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "equity_crowdfunding")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "equity_crowd": ctx["capex"],
+        "share_crowd": _to_float(details.crowd_share_percent),
+        "fee_plat": _to_float(details.platform_fee_percent),
+    }
+
+def _build_equity_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+    }
+
+
+def _build_bank_loan_inputs(scheme, ctx: dict[str, Any]) -> dict[str, Any]:
+    details = _validate_scheme_details(scheme, "bank_loan")
+    return {
+        "capex": ctx["capex"],
+        "annual_energy_savings": ctx["annual_energy_savings"],
+        "annual_maintenace_cost": ctx["annual_maintenace_cost"],
+        "project_lifetime": ctx["project_lifetime"],
+        "electricity_prices": None,
+        "inflation_rate": None,
+        "loan_amount": _to_float(details.loan_amount),
+        "loan_interest_rate": None,
+        "term_years": int(details.term_years or 0),
+    }
+
+SCHEME_HANDLERS: dict[str, tuple[Callable[..., dict[str, Any]], Callable[..., list[float]]]] = {
+    Scheme.SchemeType.EQUITY: (
+        _build_equity_inputs,
+        cash_flows,
+    ),
+    Scheme.SchemeType.BANK_LOAN: (
+        _build_bank_loan_inputs,
+        cash_flows_with_loan,
+    ),
+    Scheme.SchemeType.OPERATIONAL_LEASE: (
+        _build_operational_lease_inputs,
+        cash_flows_operational_leasing,
+    ),
+    Scheme.SchemeType.ON_BILL: (
+        _build_on_bill_inputs,
+        cash_flows_on_bill_financing,
+    ),
+    Scheme.SchemeType.GREEN_BOND_LOAN: (
+        _build_green_bond_loan_inputs,
+        cash_flows_green_bond_loan,
+    ),
+    Scheme.SchemeType.GREEN_BOND_BULLET: (
+        _build_green_bond_bullet_inputs,
+        cash_flows_green_bond_bullet,
+    ),
+    Scheme.SchemeType.EPC_GUARANTEED_SAVINGS: (
+        _build_epc_guaranteed_savings_inputs,
+        cash_flows_epc_guaranteed_savings,
+    ),
+    Scheme.SchemeType.EPC_SHARED_SAVINGS: (
+        _build_epc_shared_savings_inputs,
+        cash_flows_epc_shared_savings,
+    ),
+    Scheme.SchemeType.EPC_FIRST_OUT: (
+        _build_epc_first_out_inputs,
+        cash_flows_first_out_contract,
+    ),
+    Scheme.SchemeType.ROYALTY_CROWDFUNDING: (
+        _build_royalty_crowdfunding_inputs,
+        cash_flows_royalty_crowdfunding,
+    ),
+    Scheme.SchemeType.LENDING_CROWDFUNDING: (
+        _build_lending_crowdfunding_inputs,
+        cash_flows_lending_crowdfunding,
+    ),
+    Scheme.SchemeType.EQUITY_CROWDFUNDING: (
+        _build_equity_crowdfunding_inputs,
+        cash_flows_equity_crowdfunding,
+    ),
+}
+
+def create_scheme_definitions(experiment) -> list[dict[str, Any]]:
+    """Create scheme definitions for the financing schemes selected in an experiment."""
+    ctx = _build_context(experiment)
+    if ctx is None:
+        return []
+
+    definitions: list[dict[str, Any]] = []
+
+    for scheme in experiment.schemes.all():
+        handler = SCHEME_HANDLERS.get(scheme.scheme_type)
+        if handler is None:
+            raise SchemeConfigurationError(f"Unsupported scheme type: {scheme.scheme_type}")
+
+        build_inputs, cashflow_function = handler
+        try:
+            base_inputs = build_inputs(scheme, ctx)
+        except FinancialSimulationError:
+            raise
+        except Exception as exc:
+            raise _wrap_builder_error(scheme, exc) from exc
+
+        definitions.append({
+            "scheme_id": scheme.id,
+            "scheme_type": scheme.scheme_type,
+            "cashflow_function": cashflow_function,
+            "base_inputs": base_inputs,
+        })
+
+    return definitions
+
+def prepare_cashflow_inputs(
+    base_inputs: dict[str, Any],
+    electricity_prices: list[float],
+    inflation_rate: list[float],
+    loan_interest_rate: list[float] | None = None,
+) -> dict[str, Any]:
+    """Inject Monte Carlo sampled market inputs into a scheme's base inputs."""
+    _ensure(isinstance(base_inputs, dict), f"base_inputs must be a dictionary. Got: {type(base_inputs).__name__}")
+    lifetime = _validate_non_negative_integer("project_lifetime", base_inputs.get("project_lifetime"), allow_zero=False)
+    _validate_series("electricity_prices", electricity_prices, lifetime)
+    _validate_series("inflation_rate", inflation_rate, lifetime)
+    if loan_interest_rate is not None:
+        _validate_series("loan_interest_rate", loan_interest_rate, lifetime)
+
+    inputs = dict(base_inputs)
+
+    if "electricity_prices" in inputs:
+        inputs["electricity_prices"] = electricity_prices
+
+    if "inflation_rate" in inputs:
+        inputs["inflation_rate"] = inflation_rate
+
+    if "loan_interest_rate" in inputs:
+        inputs["loan_interest_rate"] = (
+            loan_interest_rate if loan_interest_rate is not None else [0.0] * lifetime
+        )
+
+    return inputs
+
+def IRR(flows: list[float]) -> float:
+    """Internal Rate of Return (IRR)."""
+    _validate_flows(flows)
+    try:
+        return npf.irr(flows)
+    except Exception as exc:
+        raise SimulationComputationError(f"Failed to compute IRR: {exc}") from exc
+
+def NPV(d_r: float, flows: list[float]) -> float:
+    """Net Present Value given a constant discount rate."""
+    _validate_finite_number("discount rate", d_r)
+    _validate_flows(flows)
+    try:
+        return npf.npv(d_r, flows)
+    except Exception as exc:
+        raise SimulationComputationError(f"Failed to compute NPV: {exc}") from exc
+
+def PBP(flows: list[float], loan: bool = False, loan_term: int = 0) -> float:
+    """Simple (undiscounted) PayBack Period."""
+    _validate_flows(flows)
+    if loan:
+        _validate_non_negative_integer("loan_term", loan_term, allow_zero=True)
+
+    try:
+        investment = float(flows[0]) * -1
+        if investment <= 0:
+            return np.nan
+
+        flow = [float(v) for v in flows[1:]]
+        if sum(flow) < investment:
+            pbp = np.nan
+        else:
+            total = 0.0
+            previous_total = 0.0
+            years = 0
+            for fl in flow:
+                previous_total = total
+                total += fl
+                years += 1
+                if total >= investment:
+                    break
+            else:
+                return np.nan
+
+            if years == 1:
+                recovered_before_year = 0.0
+            else:
+                recovered_before_year = previous_total
+            remaining = investment - recovered_before_year
+            current_year_contribution = total - recovered_before_year
+            if current_year_contribution == 0:
+                pbp = float(years)
+            else:
+                pbp = float(years - 1) + (float(remaining) / float(current_year_contribution))
+
+        if loan and not np.isnan(pbp) and pbp < loan_term:
+            pbp = loan_term
+        return pbp
+    except FinancialSimulationError:
+        raise
+    except Exception as exc:
+        raise SimulationComputationError(f"Failed to compute PBP: {exc}") from exc
+
+def DPP(
+    d_r: float,
+    n: int,
+    flows: list[float],
+    loan: bool = False,
+    loan_term: int = 0,
+) -> float:
+    """Discounted PayBack Period."""
+    _validate_finite_number("discount rate", d_r)
+    n = _validate_non_negative_integer("n", n, allow_zero=False)
+    _validate_flows(flows)
+    _ensure(len(flows) >= n + 1, f"flows must contain at least {n + 1} values for DPP calculation. Got: {len(flows)}", SimulationComputationError)
+    try:
+        discounted_flows = [float(flows[0])]
+        for i in range(1, n + 1):
+            flow_k = float(flows[i]) * np.power(float(1 + d_r), -i)
+            discounted_flows.append(flow_k)
+
+        dpp = PBP(discounted_flows)
+        if loan and not np.isnan(dpp) and dpp < loan_term:
+            dpp = loan_term
+        return dpp
+    except FinancialSimulationError:
+        raise
+    except Exception as exc:
+        raise SimulationComputationError(f"Failed to compute DPP: {exc}") from exc
+
+def ROI(flows: list[float]) -> float:
+    """Return on Investment (simple fraction)."""
+    _validate_flows(flows)
+    initial_investment = -float(flows[0])
+    net_profit = sum(float(v) for v in flows[1:])
+    if initial_investment == 0:
+        return np.nan
+    return (net_profit - initial_investment) / initial_investment
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Create distribution helpers (80% confidence intervals)
+# ────────────────────────────────────────────────────────────────────────────────
+
+Z90 = 1.2815515655446004  # Φ^{-1}(0.90)
+
+
+def pad_to_length(lst, length):
+        """Extend the list to the desired length by repeating the last value."""
+        return lst + [lst[-1]] * (length - len(lst)) if len(lst) < length else lst[:length]
+
+def _mu_sigma_from_p10_p50_p90(p10, p50, p90):
+    """Assume Normal on the linear scale; return arrays (mu, sigma)."""
+    p10 = np.asarray(p10, dtype=float)
+    p50 = np.asarray(p50, dtype=float)
+    p90 = np.asarray(p90, dtype=float)
+    mu = p50
+    sigma = (p90 - p10) / (2.0 * Z90)
+    # guard against zero/negative spreads
+    sigma = np.maximum(sigma, 1e-12)
+    return mu, sigma
+
+def _log_mu_sigma_from_p10_p50_p90_prices(p10, p50, p90):
+    """
+    Electricity prices: use Lognormal ⇒ Normal in log-space.
+    optimistic ≈ P90, moderate ≈ P50 (median), pessimistic ≈ P10.
+    Returns (mu_ln, sigma_ln).
+    """
+    eps = 1e-9
+    p10 = np.maximum(np.asarray(p10, dtype=float), eps)
+    p50 = np.maximum(np.asarray(p50, dtype=float), eps)
+    p90 = np.maximum(np.asarray(p90, dtype=float), eps)
+    mu_ln = np.log(p50)                      
+    sigma_ln = (np.log(p90) - np.log(p10)) / (2.0 * Z90)
+    sigma_ln = np.maximum(sigma_ln, 1e-12)
+    return mu_ln, sigma_ln
+
+
+def build_market_distributions(
+    inflation_rate_data: dict,
+    electricity_prices_data: dict,
+    interest_rate_data: dict,
+    discount_rate_data: dict,
+    project_lifetime: int,
+):
+    """
+    Derive per-year distribution parameters from the 3 scenario paths provided.
+    - Inflation, loan interest, discount: Normal(μ, σ) on linear scale.
+    - Electricity price: Lognormal via (μ_ln, σ_ln) for stability (keeps > 0).
+    Returns a dict with arrays of length == project_lifetime.
+    """
+    T = min(project_lifetime, 30)
+
+    # pad to project lifetime
+    P10_infl = pad_to_length(inflation_rate_data["pessimistic"], T)
+    P50_infl = pad_to_length(inflation_rate_data["moderate"], T)
+    P90_infl = pad_to_length(inflation_rate_data["optimistic"], T)
+    infl_mu, infl_sigma = _mu_sigma_from_p10_p50_p90(P10_infl, P50_infl, P90_infl)
+
+    P10_rate = pad_to_length(interest_rate_data["pessimistic"], T)
+    P50_rate = pad_to_length(interest_rate_data["moderate"], T)
+    P90_rate = pad_to_length(interest_rate_data["optimistic"], T)
+    rate_mu, rate_sigma = _mu_sigma_from_p10_p50_p90(P10_rate, P50_rate, P90_rate)
+
+    # expand discount rate to T
+    P10_disc = np.full(T, discount_rate_data["pessimistic"][0], dtype=float)
+    P50_disc = np.full(T, discount_rate_data["moderate"][0], dtype=float)
+    P90_disc = np.full(T, discount_rate_data["optimistic"][0], dtype=float)
+    disc_mu, disc_sigma = _mu_sigma_from_p10_p50_p90(P10_disc, P50_disc, P90_disc)
+
+    P10_elec = pad_to_length(electricity_prices_data["pessimistic"], T)
+    P50_elec = pad_to_length(electricity_prices_data["moderate"], T)
+    P90_elec = pad_to_length(electricity_prices_data["optimistic"], T)
+    elec_mu_ln, elec_sigma_ln = _log_mu_sigma_from_p10_p50_p90_prices(P10_elec, P50_elec, P90_elec)
+
+    return {
+        'inflation':  {'mu': infl_mu,  'sigma': infl_sigma,               'dist': 'normal',   'unit': '% y/y'},
+        'loan_rate':  {'mu': rate_mu,  'sigma': rate_sigma,               'dist': 'normal',   'unit': '% y/y'},
+        'discount':   {'mu': disc_mu,  'sigma': disc_sigma,               'dist': 'normal',   'unit': 'fraction'},
+        'elec_price': {'mu_ln': elec_mu_ln, 'sigma_ln': elec_sigma_ln,    'dist': 'lognormal','unit': '€/kWh'},
+        'T': T
+    }
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Scenario analysis function
+# ────────────────────────────────────────────────────────────────────────────────
+
+def get_kpi_results(
+    experiment,
+    n_sims: int = 10000,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Run Monte Carlo KPI simulations for all configured schemes."""
+    logger.info("Starting KPI simulation for experiment=%s", getattr(experiment, "id", None))
+
+    scheme_definitions = create_scheme_definitions(experiment)
+    if not scheme_definitions:
+        raise ExperimentConfigurationError("Experiment does not contain any runnable scheme definitions.")
+
+    project_lifetime = int(scheme_definitions[0]["base_inputs"]["project_lifetime"])
+
+    if n_sims <= 0:
+        raise FinancialInputError(f"n_sims must be positive, got: {n_sims}")
+    if n_sims > 1000000:
+        raise FinancialInputError(f"n_sims is too large (max 1,000,000), got: {n_sims}")
+    if not isinstance(seed, int):
+        raise FinancialInputError(f"seed must be an integer, got: {type(seed).__name__}")
+    if project_lifetime <= 0:
+        raise FinancialInputError(f"project_lifetime must be positive, got: {project_lifetime}")
+    if project_lifetime > 30: # TODO fix this
+        project_lifetime = 30
+
+    inflation_rate_data = {
+        'optimistic': pad_to_length([7.515, 9.293, 9.162, 9.021, 10.11, 10.46, 10.29, 10.90, 11.41, 11.40, 11.73, 12.23, 12.38, 12.59, 13.00, 13.25, 13.44, 13.77, 14.05, 14.26, 14.53, 14.82, 15.05, 15.30, 15.57, 15.82, 16.05, 16.32, 16.56, 16.80], project_lifetime),
+        'moderate': pad_to_length([6.11, 7.40, 6.96, 6.45, 7.20, 7.30, 6.87, 7.19, 7.48, 7.24, 7.33, 7.60, 7.54, 7.54, 7.74, 7.79, 7.77, 7.90, 7.99, 8.01, 8.09, 8.19, 8.23, 8.29, 8.39, 8.45, 8.50, 8.58, 8.65, 8.71], project_lifetime),
+        'pessimistic': pad_to_length([4.70, 5.51, 4.77, 3.88, 4.29, 4.14, 3.44, 3.49, 3.54, 3.08, 2.92, 2.98, 2.71, 2.49, 2.48, 2.32, 2.11, 2.04, 1.94, 1.76, 1.65, 1.56, 1.41, 1.29, 1.20, 1.08, 0.95, 0.85, 0.74, 0.62], project_lifetime)
+    }
+
+    electricity_prices_data = {
+        'optimistic': pad_to_length([0.271, 0.279, 0.287, 0.295, 0.303, 0.311, 0.319, 0.327, 0.335, 0.343, 0.351, 0.360, 0.368, 0.376, 0.384, 0.392, 0.400, 0.408], project_lifetime),
+        'moderate': pad_to_length([0.246, 0.254, 0.262, 0.270, 0.278, 0.286, 0.294, 0.302, 0.310, 0.318, 0.326, 0.335, 0.343, 0.351, 0.359, 0.367, 0.375, 0.383], project_lifetime),
+        'pessimistic': pad_to_length([0.221, 0.229, 0.237, 0.245, 0.253, 0.261, 0.269, 0.277, 0.285, 0.293, 0.301, 0.310, 0.318, 0.326, 0.334, 0.342, 0.350, 0.358], project_lifetime)
+    }
+
+    interest_rate_data = {
+        'optimistic': pad_to_length([5.075, 3.750, 2.425, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.312, 1.00], project_lifetime),
+        'moderate': pad_to_length([3.272, 1.947, 0.622, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49, -0.49], project_lifetime),
+        'pessimistic': pad_to_length([1.470, 0.145, -1.17, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29, -2.29], project_lifetime)
+    }
+
+    discount_rate_data = {
+        "optimistic": [0.02],
+        "moderate": [0.06],
+        "pessimistic": [0.08],
+    }
+
+    try:
+        dist_params = build_market_distributions(
+            inflation_rate_data=inflation_rate_data,
+            electricity_prices_data=electricity_prices_data,
+            interest_rate_data=interest_rate_data,
+            discount_rate_data=discount_rate_data,
+            project_lifetime=project_lifetime,
+        )
+    except Exception as exc:
+        raise SimulationComputationError(f"Failed to build market distributions: {exc}") from exc
+
+    get_kpi_results._market_distributions = dist_params
+
+    rng = np.random.default_rng(seed)
+    T = project_lifetime
+
+    infl = rng.normal(dist_params['inflation']['mu'], dist_params['inflation']['sigma'], size=(n_sims, T))
+    rate = rng.normal(dist_params['loan_rate']['mu'], dist_params['loan_rate']['sigma'], size=(n_sims, T))
+    disc = rng.normal(dist_params['discount']['mu'], dist_params['discount']['sigma'], size=(n_sims, T))
+    elec = np.exp(rng.normal(dist_params['elec_price']['mu_ln'], dist_params['elec_price']['sigma_ln'], size=(n_sims, T)))
+
+    infl = np.maximum(infl, -50.0)
+    rate = np.maximum(rate, -50.0)
+    disc = np.maximum(disc, -0.99)
+    elec = np.maximum(elec, 1e-9)
+
+    results: dict[str, Any] = {}
+
+    for scheme_def in scheme_definitions:
+        print("Running simulations for scheme:", scheme_def["scheme_type"])
+        scheme_type = scheme_def["scheme_type"]
+        cashflow_function = scheme_def["cashflow_function"]
+        base_inputs = scheme_def["base_inputs"]
+
+        irr = np.full(n_sims, np.nan)
+        npv = np.full(n_sims, np.nan)
+        pbp = np.full(n_sims, np.nan)
+        dpp = np.full(n_sims, np.nan)
+        roi = np.full(n_sims, np.nan)
+
+        for i in range(n_sims):
+            elec_i = elec[i, :].tolist()
+            infl_i = infl[i, :].tolist()
+            rate_i = rate[i, :].tolist()
+            disc_i = float(disc[i, 0])
+
+            try:
+                inputs = prepare_cashflow_inputs(
+                    base_inputs=base_inputs,
+                    electricity_prices=elec_i,
+                    inflation_rate=infl_i,
+                    loan_interest_rate=rate_i,
+                )
+                flows = cashflow_function(**inputs)
+                _validate_flows(flows)
+                irr[i] = IRR(flows)
+                npv[i] = NPV(disc_i, flows)
+                if flows[0] == 0:
+                    pbp[i] = 0
+                    dpp[i] = 0
+                elif "term_years" in inputs and inputs["term_years"]:
+                    pbp[i] = PBP(flows, loan=True, loan_term=int(inputs["term_years"]))
+                    dpp[i] = DPP(disc_i, T, flows, loan=True, loan_term=int(inputs["term_years"]))
+                else:
+                    pbp[i] = PBP(flows)
+                    dpp[i] = DPP(disc_i, T, flows)
+                roi[i] = ROI(flows)
+            except FinancialSimulationError:
+                raise
+            except Exception as exc:
+                raise SimulationComputationError(
+                    f"Simulation failed for scheme '{scheme_type}' at iteration {i}: {exc}"
+                ) from exc
+
+        censor_value = T + 1
+        pbp_censored = np.where(np.isnan(pbp), censor_value, pbp)
+        dpp_censored = np.where(np.isnan(dpp), censor_value, dpp)
+
+        def pct(a, qs=(5, 10, 25, 50, 75, 90, 95)):
+            a = np.asarray(a, dtype=float)
+            return {f"P{q}": np.nanpercentile(a, q) for q in qs}
+
+        disc_target = float(np.nanmedian(disc[:, 0]))
+
+        def pr(mask):
+            m = np.asarray(mask, dtype=bool)
+            return float(np.nanmean(m))
+
+        summary = {
+            "percentiles": {
+                "IRR": pct(irr),
+                "NPV": pct(npv),
+                "PBP": pct(pbp_censored),
+                "DPP": pct(dpp_censored),
+                "ROI": pct(roi),
+            },
+            "probabilities": {
+                "Pr(NPV > 0)": pr(npv > 0),
+                f"Pr(PBP < {T}y)": pr(pbp < T),
+                f"Pr(DPP < {T}y)": pr(dpp < T),
+            },
+            "disc_target_used": disc_target,
+            "n_sims": n_sims,
+        }
+
+        results[scheme_type] = {
+            "scheme_id": scheme_def["scheme_id"],
+            "summary": summary,
+        }
+    return results
+
+def run_experiment(experiment, run):
+    try:
+        logger.info("Experiment simulation started for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
+
+        results = get_kpi_results(
+            experiment=experiment,
+            n_sims=10000,
+            seed=42,
+        )
+        logger.info("Experiment simulation finished for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
+        save_scheme_results(
+            experiment=experiment,
+            results=results,
+            run=run,
+        )
+        logger.info("Scheme results saved for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
+        logger.info("experiment results are: %s", results)
+        run.status = Run.Status.COMPLETED
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "finished_at"])
+        experiment.status = Experiment.Status.COMPLETED
+        experiment.save(update_fields=["status", "updated_at"])
+        return results
+
+    except Exception as exc:
+        logger.exception("Experiment failed for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
+        run.status = Run.Status.FAILED
+        run.finished_at = timezone.now()
+        run.save(update_fields=["status", "finished_at"])
+
+        experiment.status = Experiment.Status.FAILED
+        experiment.save(update_fields=["status", "updated_at"])
+
+        if isinstance(exc, FinancialSimulationError):
+            raise
+        raise FinancialSimulationError(f"Experiment execution failed: {exc}") from exc
+
+

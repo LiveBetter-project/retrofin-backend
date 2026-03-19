@@ -18,6 +18,8 @@ def generate_scheme_id():
 def generate_run_id():
     return "run_" + secrets.token_hex(8)
 
+def generate_scheme_result_id():
+    return "res_" + secrets.token_hex(8)
 
 class User(AbstractUser):
     email = models.EmailField(unique=True)
@@ -151,6 +153,7 @@ class SchemeRoyaltyCrowdfunding(models.Model):
     platform_fee_percent = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
     loan_amount = models.DecimalField(max_digits=15, decimal_places=2, null=True, blank=True)
     term_years = models.IntegerField(null=True, blank=True)
+    # change name to royalty_rate (# % of gross revenue paid to crowd as royalty (e.g., 0.10 for 10%))
     fixed_interest_rate = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
 
     class Meta:
@@ -236,24 +239,85 @@ class Run(models.Model):
     def __str__(self):
         return f"{self.id} ({self.status})"
 
-
 class SchemeResult(models.Model):
-    id = models.CharField(primary_key=True, max_length=32, editable=False)
+    id = models.CharField(primary_key=True, max_length=32, editable=False, default=generate_scheme_result_id)
     scheme = models.ForeignKey(Scheme, on_delete=models.CASCADE, related_name="results")
     building = models.ForeignKey(Building, on_delete=models.CASCADE, related_name="scheme_results")
-    # TBD
-    # npv = models.DecimalField(max_digits=15, decimal_places=2)
-    # irr = models.DecimalField(max_digits=6, decimal_places=4)
-    # payback_period_years = models.DecimalField(max_digits=6, decimal_places=2)
-    calculated_at = models.DateTimeField(auto_now_add=True)
+    run = models.ForeignKey(
+        Run,
+        on_delete=models.CASCADE,
+        related_name="scheme_results",
+        null=True,
+        blank=True,
+    )
+
+    # IRR percentiles
+    irr_p5 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    irr_p10 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    irr_p25 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    irr_p50 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    irr_p75 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    irr_p90 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    irr_p95 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+
+    # NPV percentiles
+    npv_p5 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    npv_p10 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    npv_p25 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    npv_p50 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    npv_p75 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    npv_p90 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    npv_p95 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+
+    # PBP percentiles
+    pbp_p5 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    pbp_p10 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    pbp_p25 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    pbp_p50 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    pbp_p75 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    pbp_p90 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    pbp_p95 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+
+    # DPP percentiles
+    dpp_p5 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    dpp_p10 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    dpp_p25 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    dpp_p50 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    dpp_p75 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    dpp_p90 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    dpp_p95 = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+
+    # ROI percentiles
+    roi_p5 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    roi_p10 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    roi_p25 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    roi_p50 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    roi_p75 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    roi_p90 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    roi_p95 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+
+    # Probabilities
+    pr_npv_positive = models.DecimalField(max_digits=8, decimal_places=6, null=True, blank=True)
+    pr_pbp_within_lifetime = models.DecimalField(max_digits=8, decimal_places=6, null=True, blank=True)
+    pr_dpp_within_lifetime = models.DecimalField(max_digits=8, decimal_places=6, null=True, blank=True)
+
+    # Metadata
+    disc_target_used = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    n_sims = models.PositiveIntegerField(default=0)
+
+    calculated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "scheme_results"
         constraints = [
-            models.UniqueConstraint(fields=["scheme", "building"], name="unique_result_per_scheme_building")
+            models.UniqueConstraint(
+                fields=["run", "scheme", "building"],
+                name="unique_result_per_run_scheme_building",
+            )
         ]
         indexes = [
             models.Index(fields=["scheme"]),
             models.Index(fields=["building"]),
+            models.Index(fields=["run"]),
         ]
 

@@ -4,7 +4,6 @@ from rest_framework import routers
 
 from main.views import (
     AuthenticationView,
-    FinancialSimulation,
     ExperimentViewSet,
     BuildingViewSet,
     FinancingSchemeCatalogViewSet,
@@ -14,7 +13,7 @@ from main.views import (
 
 router = routers.DefaultRouter()
 router.register(r'auth', AuthenticationView, basename='auth')
-router.register(r'financial', FinancialSimulation, basename='financial')
+# router.register(r'financial', FinancialSimulation, basename='financial')
 
 # Financing scheme catalog (static, no experiment scope)
 router.register(r'financing-schemes', FinancingSchemeCatalogViewSet, basename='financing-schemes')
