@@ -5,6 +5,7 @@ from rest_framework.response import Response
 
 from main.models import Experiment, Run
 from main.serializers import ExperimentSerializer, ExperimentUpdateSerializer
+from main.views.financial_simulation import *
 
 
 class ExperimentViewSet(viewsets.ModelViewSet):
@@ -65,11 +66,10 @@ class ExperimentViewSet(viewsets.ModelViewSet):
                 {"error": {"code": "NOT_READY", "message": "Experiment is not ready to run.", "details": missing}},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
         run = Run.objects.create(experiment=experiment)
         experiment.status = Experiment.Status.RUNNING
         experiment.save(update_fields=["status", "updated_at"])
-
+        run_experiment(experiment, run)
         return Response(
             {"run_id": run.id, "status": run.status, "started_at": run.started_at},
             status=status.HTTP_201_CREATED,
