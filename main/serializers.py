@@ -88,6 +88,13 @@ class ExperimentSerializer(serializers.ModelSerializer):
         value = value.strip()
         if not value:
             raise serializers.ValidationError("Name cannot be blank.")
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            qs = Experiment.objects.filter(user=request.user, name=value)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError("An experiment with this name already exists.")
         return value
 
     def create(self, validated_data):
@@ -109,6 +116,13 @@ class ExperimentUpdateSerializer(serializers.ModelSerializer):
         value = (value or "").strip()
         if not value:
             raise serializers.ValidationError("Name cannot be blank.")
+        request = self.context.get('request')
+        if request and hasattr(request, 'user'):
+            qs = Experiment.objects.filter(user=request.user, name=value)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError("An experiment with this name already exists.")
         return value
 
 
