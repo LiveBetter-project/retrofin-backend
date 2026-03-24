@@ -43,6 +43,39 @@ class ExperimentViewSet(viewsets.ModelViewSet):
         # Return full experiment shape
         return Response(ExperimentSerializer(instance).data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get"], url_path="results")
+    def results(self, request, pk=None):
+        experiment = self.get_object()
+        latest_run = experiment.runs.order_by("-started_at").first()
+        if latest_run is None:
+            return Response({"run_id": None, "run_status": None, "items": []})
+
+        def _f(v):
+            return float(v) if v is not None else None
+
+        items = []
+        for sr in latest_run.scheme_results.select_related("scheme").all():
+            items.append({
+                "scheme_id": sr.scheme.id,
+                "scheme_type": sr.scheme.scheme_type,
+                "irr_p5":  _f(sr.irr_p5),  "irr_p10":  _f(sr.irr_p10),  "irr_p25":  _f(sr.irr_p25),
+                "irr_p50": _f(sr.irr_p50), "irr_p75":  _f(sr.irr_p75),  "irr_p90":  _f(sr.irr_p90),  "irr_p95":  _f(sr.irr_p95),
+                "npv_p5":  _f(sr.npv_p5),  "npv_p10":  _f(sr.npv_p10),  "npv_p25":  _f(sr.npv_p25),
+                "npv_p50": _f(sr.npv_p50), "npv_p75":  _f(sr.npv_p75),  "npv_p90":  _f(sr.npv_p90),  "npv_p95":  _f(sr.npv_p95),
+                "pbp_p5":  _f(sr.pbp_p5),  "pbp_p10":  _f(sr.pbp_p10),  "pbp_p25":  _f(sr.pbp_p25),
+                "pbp_p50": _f(sr.pbp_p50), "pbp_p75":  _f(sr.pbp_p75),  "pbp_p90":  _f(sr.pbp_p90),  "pbp_p95":  _f(sr.pbp_p95),
+                "dpp_p5":  _f(sr.dpp_p5),  "dpp_p10":  _f(sr.dpp_p10),  "dpp_p25":  _f(sr.dpp_p25),
+                "dpp_p50": _f(sr.dpp_p50), "dpp_p75":  _f(sr.dpp_p75),  "dpp_p90":  _f(sr.dpp_p90),  "dpp_p95":  _f(sr.dpp_p95),
+                "roi_p5":  _f(sr.roi_p5),  "roi_p10":  _f(sr.roi_p10),  "roi_p25":  _f(sr.roi_p25),
+                "roi_p50": _f(sr.roi_p50), "roi_p75":  _f(sr.roi_p75),  "roi_p90":  _f(sr.roi_p90),  "roi_p95":  _f(sr.roi_p95),
+                "pr_npv_positive":        _f(sr.pr_npv_positive),
+                "pr_pbp_within_lifetime": _f(sr.pr_pbp_within_lifetime),
+                "pr_dpp_within_lifetime": _f(sr.pr_dpp_within_lifetime),
+                "disc_target_used":       _f(sr.disc_target_used),
+                "n_sims": sr.n_sims,
+            })
+        return Response({"run_id": latest_run.id, "run_status": latest_run.status, "items": items})
+
     @action(detail=True, methods=["get"], url_path="readiness")
     def readiness(self, request, pk=None):
         experiment = self.get_object()
