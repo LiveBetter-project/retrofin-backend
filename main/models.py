@@ -296,10 +296,23 @@ class SchemeResult(models.Model):
     roi_p90 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
     roi_p95 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
 
+    # Total repayment permodels.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    total_repayment_p5 = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    total_repayment_p10 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    total_repayment_p25 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    total_repayment_p50 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    total_repayment_p75 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    total_repayment_p90 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    total_repayment_p95 = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+
     # Probabilities
     pr_npv_positive = models.DecimalField(max_digits=8, decimal_places=6, null=True, blank=True)
     pr_pbp_within_lifetime = models.DecimalField(max_digits=8, decimal_places=6, null=True, blank=True)
     pr_dpp_within_lifetime = models.DecimalField(max_digits=8, decimal_places=6, null=True, blank=True)
+
+    # might chnage this later
+    kpi_histograms = models.JSONField(null=True, blank=True, default=dict)
+
 
     # Metadata
     disc_target_used = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
@@ -321,3 +334,27 @@ class SchemeResult(models.Model):
             models.Index(fields=["run"]),
         ]
 
+    class SchemeResultCashflow(models.Model):
+        id = models.BigAutoField(primary_key=True)
+        scheme_result = models.ForeignKey(
+            "SchemeResult",
+            on_delete=models.CASCADE,
+            related_name="cashflows",
+        )
+
+        year = models.PositiveIntegerField()
+        inflow = models.DecimalField(max_digits=18, decimal_places=2) #p50
+        outflow = models.DecimalField(max_digits=18, decimal_places=2) #p50
+        
+        class Meta:
+            db_table = "scheme_result_cashflows"
+            constraints = [
+                models.UniqueConstraint(
+                    fields=["scheme_result", "year"],
+                    name="unique_cashflow_per_result_year_kind",
+                )
+            ]
+            indexes = [
+                models.Index(fields=["scheme_result", "year"]),
+            ]
+            ordering = ["scheme_result", "year"]

@@ -10,6 +10,9 @@ import numpy_financial as npf
 import itertools
 import math
 import matplotlib.pyplot as plt
+import json
+import tempfile
+from pathlib import Path
 from decimal import Decimal
 from django.utils import timezone
 import logging
@@ -116,11 +119,109 @@ def _to_decimal_or_none(value):
     return Decimal(str(value))
 
 
+def _build_kpi_histogram_payload(
+    name: str,
+    values: Any,
+    *,
+    bins: int = 30,
+    censor_value: float | None = None,
+    project_lifetime: int | None = None,
+) -> dict[str, Any]:
+    raw = np.asarray(values, dtype=float)
+    empty_payload = {
+        "bin_edges": [],
+        "feasible_counts": [],
+        "infeasible_counts": [],
+        "p10": None,
+        "p50": None,
+        "p90": None,
+        "censor_value": float(censor_value) if censor_value is not None else None,
+        "project_lifetime": int(project_lifetime) if project_lifetime is not None else None,
+    }
+
+    if name in ("PBP", "DPP"):
+        a = raw[np.isfinite(raw)]
+        if a.size == 0:
+            return empty_payload
+
+        if project_lifetime is not None:
+            infeasible_mask = (a > float(project_lifetime))
+        elif censor_value is not None:
+            infeasible_mask = np.isclose(a, float(censor_value))
+        else:
+            infeasible_mask = np.zeros_like(a, dtype=bool)
+
+        feasible = a[~infeasible_mask]
+        infeasible = a[infeasible_mask]
+
+        if a.size == 1 or np.isclose(a.min(), a.max()):
+            center = float(a[0])
+            bin_edges = np.array([max(center - 0.5, 0.0), center + 0.5], dtype=float)
+        else:
+            bin_edges = np.histogram_bin_edges(a, bins=bins)
+
+        feasible_counts, _ = np.histogram(feasible, bins=bin_edges)
+        infeasible_counts, _ = np.histogram(infeasible, bins=bin_edges)
+        percentile_source = a
+    else:
+        a = raw[np.isfinite(raw)]
+        if a.size == 0:
+            return empty_payload
+
+        if name in ("NPV", "IRR", "ROI"):
+            infeasible_mask = (a < 0)
+        else:
+            infeasible_mask = np.zeros_like(a, dtype=bool)
+
+        feasible = a[~infeasible_mask]
+        infeasible = a[infeasible_mask]
+        bin_edges = np.histogram_bin_edges(a, bins=bins)
+        feasible_counts, _ = np.histogram(feasible, bins=bin_edges)
+        infeasible_counts, _ = np.histogram(infeasible, bins=bin_edges)
+        percentile_source = a
+
+    if percentile_source.size == 0:
+        p10 = p50 = p90 = None
+    else:
+        p10, p50, p90 = np.percentile(percentile_source, [10, 50, 90])
+
+    return {
+        "bin_edges": bin_edges.tolist(),
+        "feasible_counts": feasible_counts.tolist(),
+        "infeasible_counts": infeasible_counts.tolist(),
+        "p10": float(p10) if p10 is not None else None,
+        "p50": float(p50) if p50 is not None else None,
+        "p90": float(p90) if p90 is not None else None,
+        "censor_value": float(censor_value) if censor_value is not None else None,
+        "project_lifetime": int(project_lifetime) if project_lifetime is not None else None,
+    }
+
+
+def _dump_results_to_temp_json(experiment, run, results: dict) -> Path | None:
+    try:
+        temp_dir = Path("./temp_scheme_results")
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        identifier = f"experiment_{getattr(experiment, 'id', 'unknown')}"
+        if run is not None:
+            identifier += f"_run_{getattr(run, 'id', 'unknown')}"
+        timestamp = timezone.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = temp_dir / f"{identifier}_{timestamp}_scheme_results.json"
+        with path.open("w", encoding="utf-8") as json_file:
+            json.dump(results, json_file, indent=2, default=str, ensure_ascii=False)
+        logger.info("Temporarily saved scheme results to %s", path)
+        return path
+    except Exception as exc:
+        logger.exception("Failed to write temporary scheme results JSON: %s", exc)
+        return None
+
+
 def save_scheme_results(experiment, results: dict, run=None):
     building = experiment.buildings.first()
     if building is None:
         raise ExperimentConfigurationError("Cannot save scheme results because the experiment has no building.")
     _ensure(isinstance(results, dict), f"results must be a dictionary. Got: {type(results).__name__}", ResultPersistenceError)
+    _dump_results_to_temp_json(experiment, run, results)
+    cashflow_model = getattr(SchemeResult, "SchemeResultCashflow", None)
 
     saved = []
     logger.info("Saving scheme results for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
@@ -139,6 +240,12 @@ def save_scheme_results(experiment, results: dict, run=None):
             pbp = percentiles.get("PBP", {})
             dpp = percentiles.get("DPP", {})
             roi = percentiles.get("ROI", {})
+            total_repayment = percentiles.get("total_repayment", {})
+            cashflow_distributions = scheme_result.get("cashflow_distributions", {})
+            kpi_histograms = scheme_result.get("kpi_histograms", {})
+            years = cashflow_distributions.get("years", [])
+            inflow_p50 = cashflow_distributions.get("inflows", {}).get("P50", [])
+            outflow_p50 = cashflow_distributions.get("outflows", {}).get("P50", [])
 
             obj, _ = SchemeResult.objects.update_or_create(
                 run=run,
@@ -185,6 +292,14 @@ def save_scheme_results(experiment, results: dict, run=None):
                     "roi_p90": _to_decimal_or_none(roi.get("P90")),
                     "roi_p95": _to_decimal_or_none(roi.get("P95")),
 
+                    "total_repayment_p5": _to_decimal_or_none(total_repayment.get("P5")),
+                    "total_repayment_p10": _to_decimal_or_none(total_repayment.get("P10")),
+                    "total_repayment_p25": _to_decimal_or_none(total_repayment.get("P25")),
+                    "total_repayment_p50": _to_decimal_or_none(total_repayment.get("P50")),
+                    "total_repayment_p75": _to_decimal_or_none(total_repayment.get("P75")),
+                    "total_repayment_p90": _to_decimal_or_none(total_repayment.get("P90")),
+                    "total_repayment_p95": _to_decimal_or_none(total_repayment.get("P95")),
+
                     "pr_npv_positive": _to_decimal_or_none(probabilities.get("Pr(NPV > 0)")),
                     "pr_pbp_within_lifetime": _to_decimal_or_none(
                         probabilities.get(f"Pr(PBP < {building.eem_lifetime}y)")
@@ -192,10 +307,23 @@ def save_scheme_results(experiment, results: dict, run=None):
                     "pr_dpp_within_lifetime": _to_decimal_or_none(
                         probabilities.get(f"Pr(DPP < {building.eem_lifetime}y)")
                     ),
+                    "kpi_histograms": kpi_histograms,
                     "disc_target_used": _to_decimal_or_none(summary.get("disc_target_used")),
                     "n_sims": summary.get("n_sims", 0),
                 },
             )
+
+            if cashflow_model is not None and years and len(years) == len(inflow_p50) == len(outflow_p50):
+                cashflow_model.objects.filter(scheme_result=obj).exclude(year__in=years).delete()
+                for year, inflow, outflow in zip(years, inflow_p50, outflow_p50):
+                    cashflow_model.objects.update_or_create(
+                        scheme_result=obj,
+                        year=year,
+                        defaults={
+                            "inflow": _to_decimal_or_none(inflow),
+                            "outflow": _to_decimal_or_none(outflow),
+                        },
+                    )
         except Exception as exc:
             raise ResultPersistenceError(
                 f"Failed to save results for scheme '{scheme.scheme_type}': {exc}"
@@ -233,8 +361,12 @@ def cash_flows_operational_leasing(
         covers the initial CAPEX.
     """
     flows = []
+    inflows = []
+    outflows = []
     # Year 0: lessor covers CAPEX
-    flows.append(0)
+    flows.append(-1)
+    inflows.append(0)
+    outflows.append(0)
 
     for t in range(1, project_lifetime + 1):
         idx = t - 1
@@ -247,9 +379,11 @@ def cash_flows_operational_leasing(
             D_t = lease_payment
         else:
             D_t = 0.0
+        inflows.append(revenue)
+        outflows.append(D_t)
         flows.append(op_cf - D_t)
 
-    return flows
+    return flows, inflows, outflows
 
 #interest is usually low
 def cash_flows_on_bill_financing(
@@ -290,9 +424,13 @@ def cash_flows_on_bill_financing(
         covers the initial CAPEX.
     """
     flows = []
+    inflows = []
+    outflows = []
 
     # Year 0: provider covers 100% CAPEX
-    flows.append(0)
+    flows.append(-1)
+    inflows.append(0)
+    outflows.append(0)
 
     outstanding = capex
     principal = capex / term_years if term_years > 0 else 0
@@ -313,9 +451,12 @@ def cash_flows_on_bill_financing(
         else:
             D_t = 0.0
 
+        inflows.append(revenue)
+        outflows.append(om_t + D_t)
         flows.append(op_cf - D_t)
 
-    return flows
+    return flows, inflows, outflows
+
 
 def cash_flows_green_bond_loan(
     capex: float,
@@ -361,8 +502,12 @@ def cash_flows_green_bond_loan(
         after deducting green bond proceeds.
     """
     flows = []
+    inflows = []
+    outflows = []
 
     flows.append(-(capex - gb_proceeds))
+    inflows.append(gb_proceeds)
+    outflows.append(capex)
 
     outstanding = gb_proceeds
     principal = gb_proceeds / term_years
@@ -383,9 +528,11 @@ def cash_flows_green_bond_loan(
             outstanding -= principal
         else:
             D_t = 0.0
+        inflows.append(revenue)
+        outflows.append(om_t + om_green_t + D_t)
         flows.append(op_cf - D_t)
 
-    return flows
+    return flows, inflows, outflows
 
 def cash_flows_green_bond_bullet(
     capex: float,
@@ -431,7 +578,11 @@ def cash_flows_green_bond_bullet(
         after deducting green bond proceeds.
     """
     flows = []
+    inflows = []
+    outflows = []
     flows.append(-(capex - gb_proceeds))
+    inflows.append(gb_proceeds)
+    outflows.append(capex)
 
     outstanding = gb_proceeds  # bullet principal stays constant until maturity
     cumulative_inflation = 1.0
@@ -455,9 +606,11 @@ def cash_flows_green_bond_bullet(
         else:
             D_t = 0.0
 
+        inflows.append(revenue)
+        outflows.append(om_t + om_green_t + D_t)
         flows.append(op_cf - D_t)
 
-    return flows
+    return flows, inflows, outflows
 
 def cash_flows_epc_guaranteed_savings(
     capex: float,
@@ -500,7 +653,11 @@ def cash_flows_epc_guaranteed_savings(
         makes no initial outlay.
     """
     flows = []
-    flows.append(0)
+    inflows = []
+    outflows = []
+    flows.append(-1)
+    inflows.append(capex)
+    outflows.append(capex)
     outstanding = capex
     principal = capex / term_years if term_years > 0 else 0
     cumulative_inflation = 1.0
@@ -526,9 +683,11 @@ def cash_flows_epc_guaranteed_savings(
         else:
             comp = 0.0
         cf_t = op_cf - D_t + comp
+        inflows.append(AS_t + comp)
+        outflows.append(om_t + D_t)
         flows.append(cf_t)
 
-    return flows
+    return flows, inflows, outflows
 
 # we alo need the number of years that the contract is active for and ESCO gets money
 def cash_flows_epc_shared_savings(
@@ -565,8 +724,12 @@ def cash_flows_epc_shared_savings(
         Cash-flow sequence where the first entry is ``0`` because the ESCO
         covers the initial CAPEX.
     """
-    flows = [] 
-    flows.append(0)     # Year 0: ESCO covers entire CAPEX
+    flows = []
+    inflows = []
+    outflows = []
+    flows.append(-1)     # Year 0: ESCO covers entire CAPEX
+    inflows.append(0)
+    outflows.append(0)
     cumulative_inflation = 1.0
 
     for t in range(1, project_lifetime + 1):
@@ -580,10 +743,12 @@ def cash_flows_epc_shared_savings(
             D_t = AS_t * p_ESCO 
         else:
             D_t = 0.0
-        
+
+        inflows.append(AS_t)
+        outflows.append(om_t + D_t)
         flows.append(op_cf - D_t)  
 
-    return flows
+    return flows, inflows, outflows
 
 # makes sense as an ESCO (always good for client? what if maintance is higher that savings?):
 def cash_flows_first_out_contract(
@@ -593,7 +758,7 @@ def cash_flows_first_out_contract(
     project_lifetime: int,
     electricity_prices: list[float],
     inflation_rate: list[float],
-) -> list[float]:
+) -> tuple[list[float], list[float], list[float]]:
     """Compute yearly net cash-flows for a **first-out ESCO contract**.
 
     Parameters
@@ -618,7 +783,11 @@ def cash_flows_first_out_contract(
         makes no initial outlay and savings first repay the ESCO investment.
     """
     flows = []
-    flows.append(0)  # Year 0: ESCO covers 100% of CAPEX, client pays nothing upfront
+    inflows = []
+    outflows = []
+    flows.append(-1)  # Year 0: ESCO covers 100% of CAPEX, client pays nothing upfront
+    inflows.append(0)
+    outflows.append(0)
     D_paid = 0.0
     cumulative_inflation = 1.0
 
@@ -639,9 +808,11 @@ def cash_flows_first_out_contract(
             D_paid += D_t
 
         cf_t = op_cf - D_t
+        inflows.append(AS_t)
+        outflows.append(om_t + D_t)
         flows.append(cf_t)
 
-    return flows
+    return flows, inflows, outflows
 
 def cash_flows_royalty_crowdfunding(
     capex: float,
@@ -687,10 +858,14 @@ def cash_flows_royalty_crowdfunding(
         platform fees and CAPEX.
     """
     flows = []
+    inflows = []
+    outflows = []
 
     # Year 0
     plat_cost = loan_crowd * fee_plat 
     flows.append(loan_crowd - plat_cost - capex)
+    inflows.append(loan_crowd)
+    outflows.append(plat_cost + capex)
     cumulative_inflation = 1.0
 
     for t in range(1, project_lifetime + 1):
@@ -706,9 +881,11 @@ def cash_flows_royalty_crowdfunding(
             pay_crowd = 0.0
 
         om_t = annual_maintenace_cost * cumulative_inflation
+        inflows.append(revenue)
+        outflows.append(pay_crowd + om_t)
         flows.append(revenue - pay_crowd - om_t)
 
-    return flows
+    return flows, inflows, outflows
 
 # the interest rate is usually fixed and agreed beforehand
 # acts like a loan through crowdfunding
@@ -723,7 +900,7 @@ def cash_flows_lending_crowdfunding(
     fixed_interest: float,  # fixed predefined interest rate (e.g., 0.05 for 5%)
     term_years: int,         # term of loan in *years* (must be at least 1)
     fee_plat: float,        # platform success fee rate (e.g., 0.05 for 5%)
-) -> list[float]:
+) -> tuple[list[float], list[float], list[float]]:
     """Compute yearly net cash-flows for **lending-based crowdfunding**.
 
     Parameters
@@ -756,10 +933,14 @@ def cash_flows_lending_crowdfunding(
         platform fees and CAPEX.
     """
     flows = []
+    inflows = []
+    outflows = []
 
     # Year 0
     plat_cost = loan_crowd * fee_plat 
     flows.append(loan_crowd - plat_cost - capex)
+    inflows.append(loan_crowd)
+    outflows.append(plat_cost + capex)
 
     # Fixed annual debt payment 
     r = fixed_interest
@@ -784,9 +965,11 @@ def cash_flows_lending_crowdfunding(
             D_crowd = debt_payment
         else:
             D_crowd = 0.0
+        inflows.append(AS_t)
+        outflows.append(om_t + D_crowd)
         flows.append(op_cf - D_crowd)
     
-    return flows
+    return flows, inflows, outflows
 
 # her investors have co-ownership of the project
 def cash_flows_equity_crowdfunding(
@@ -799,7 +982,7 @@ def cash_flows_equity_crowdfunding(
     equity_crowd: float,                # capital raised from crowd at t=0
     share_crowd: float,                 # % of profits paid to crowd when positive (e.g., 0.5 for 50%)
     fee_plat: float,                    # platform success fee rate (e.g., 0.05 for 5%)
-) -> list[float]:
+) -> tuple[list[float], list[float], list[float]]:
     """Compute yearly net cash-flows for **equity crowdfunding**.
 
     Parameters
@@ -833,11 +1016,14 @@ def cash_flows_equity_crowdfunding(
     try:
         T = project_lifetime
         flows = []
+        inflows = []
+        outflows = []
         # Year 0
         plat_cost = equity_crowd * fee_plat
         cf0 = equity_crowd - plat_cost - capex
         flows.append(cf0)
-
+        inflows.append(equity_crowd)
+        outflows.append(plat_cost + capex)
         # Operating years
         cumulative_infl = 1.0
         for t in range(1, T + 1):
@@ -852,9 +1038,11 @@ def cash_flows_equity_crowdfunding(
                 esco_cf = distributable_cf * (1 - share_crowd)
             else:
                 esco_cf = 0.0
+            inflows.append(revenue)
+            outflows.append(costs + (distributable_cf - esco_cf))
             flows.append(esco_cf)
 
-        return flows
+        return flows, inflows, outflows
     except Exception as exc:
         raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
 
@@ -868,7 +1056,7 @@ def cash_flows_with_loan(
     loan_amount: float,
     loan_interest_rate: list[float],
     term_years: int,
-) -> list[float]:
+) -> tuple[list[float], list[float], list[float]]:
     """Compute the yearly net cash-flow profile **including** debt service.
 
     Parameters
@@ -901,9 +1089,13 @@ def cash_flows_with_loan(
     """
     try:
         flows = []
+        inflows = []
+        outflows = []
         
         # capex minus the loan received
         flows.append(-(capex-loan_amount))
+        inflows.append(loan_amount)
+        outflows.append(capex)
         
         outstanding = loan_amount
         constant_principal_payment = loan_amount / term_years if term_years > 0 else 0.0
@@ -919,9 +1111,11 @@ def cash_flows_with_loan(
                 loan_payment = constant_principal_payment + interest_payment
                 outstanding -= constant_principal_payment  
             
+            inflows.append(annual_energy_savings * electricity_prices[year])
+            outflows.append(annual_maintenace_cost * cumulative_infl + loan_payment)
             flows.append(operating_cf - loan_payment)
         
-        return flows
+        return flows, inflows, outflows
     except Exception as exc:
         raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
 
@@ -932,7 +1126,7 @@ def cash_flows(
     project_lifetime: int,
     electricity_prices: list[float],
     inflation_rate: list[float],
-) -> list[float]:
+) -> tuple[list[float], list[float], list[float]]:
     """Compute yearly net cash-flows for an **equity-only** project.
 
     This variant omits any debt-service considerations and is therefore a
@@ -950,12 +1144,16 @@ def cash_flows(
     """
     try:
         flows = [-capex] # t = 0 equity investment
+        inflows = [0]
+        outflows = [capex]
         cumulative_infl = 1.0
         for k in range(0, project_lifetime):
             cumulative_infl *= (1 + inflation_rate[k]/100.0)
             flow_k = annual_energy_savings * electricity_prices[k] - annual_maintenace_cost * cumulative_infl
+            inflows.append(annual_energy_savings * electricity_prices[k])
+            outflows.append(annual_maintenace_cost * cumulative_infl)
             flows.append(flow_k)
-        return flows
+        return flows, inflows, outflows
     except Exception as exc:
         raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
 
@@ -1239,6 +1437,7 @@ def prepare_cashflow_inputs(
     electricity_prices: list[float],
     inflation_rate: list[float],
     loan_interest_rate: list[float] | None = None,
+    annual_energy_savings: float | None = None,
 ) -> dict[str, Any]:
     """Inject Monte Carlo sampled market inputs into a scheme's base inputs."""
     _ensure(isinstance(base_inputs, dict), f"base_inputs must be a dictionary. Got: {type(base_inputs).__name__}")
@@ -1247,8 +1446,13 @@ def prepare_cashflow_inputs(
     _validate_series("inflation_rate", inflation_rate, lifetime)
     if loan_interest_rate is not None:
         _validate_series("loan_interest_rate", loan_interest_rate, lifetime)
+    if annual_energy_savings is not None:
+        _validate_finite_number("annual_energy_savings", annual_energy_savings)
 
     inputs = dict(base_inputs)
+
+    if "annual_energy_savings" in inputs and annual_energy_savings is not None:
+        inputs["annual_energy_savings"] = float(annual_energy_savings)
 
     if "electricity_prices" in inputs:
         inputs["electricity_prices"] = electricity_prices
@@ -1291,35 +1495,40 @@ def PBP(flows: list[float], loan: bool = False, loan_term: int = 0) -> float:
         if investment <= 0:
             return np.nan
 
-        flow = [float(v) for v in flows[1:]]
-        if sum(flow) < investment:
-            pbp = np.nan
-        else:
-            total = 0.0
-            previous_total = 0.0
-            years = 0
-            for fl in flow:
-                previous_total = total
-                total += fl
-                years += 1
-                if total >= investment:
-                    break
-            else:
-                return np.nan
+        max_years = 100  # safety limit
 
-            if years == 1:
-                recovered_before_year = 0.0
+        total = 0.0
+        previous_total = 0.0
+        years = 0
+
+        for i in range(1, max_years + 1):
+            if i < len(flows):
+                fl = float(flows[i])
             else:
-                recovered_before_year = previous_total
-            remaining = investment - recovered_before_year
-            current_year_contribution = total - recovered_before_year
-            if current_year_contribution == 0:
-                pbp = float(years)
-            else:
-                pbp = float(years - 1) + (float(remaining) / float(current_year_contribution))
+                fl = float(flows[-1])  # option 1: repeat last known cashflow
+
+            previous_total = total
+            total += fl
+            years += 1
+
+            if total >= investment:
+                break
+        else:
+            return np.nan
+
+        remaining = investment - previous_total
+        current_year_contribution = total - previous_total
+
+        if current_year_contribution == 0:
+            pbp = float(years)
+        else:
+            pbp = float(years - 1) + (
+                float(remaining) / float(current_year_contribution)
+            )
 
         if loan and not np.isnan(pbp) and pbp < loan_term:
             pbp = loan_term
+
         return pbp
     except FinancialSimulationError:
         raise
@@ -1332,6 +1541,7 @@ def DPP(
     flows: list[float],
     loan: bool = False,
     loan_term: int = 0,
+    max_years: int = 100,
 ) -> float:
     """Discounted PayBack Period."""
     _validate_finite_number("discount rate", d_r)
@@ -1339,14 +1549,25 @@ def DPP(
     _validate_flows(flows)
     _ensure(len(flows) >= n + 1, f"flows must contain at least {n + 1} values for DPP calculation. Got: {len(flows)}", SimulationComputationError)
     try:
-        discounted_flows = [float(flows[0])]
-        for i in range(1, n + 1):
-            flow_k = float(flows[i]) * np.power(float(1 + d_r), -i)
+        discounted_flows = [flows[0]]
+
+        for i in range(1, max_years + 1):
+            if i < len(flows):
+                cashflow = flows[i]
+            else:
+                cashflow = flows[-1]  # repeat last known cashflow
+
+            flow_k = cashflow * np.power(1 + float(d_r), -i)
             discounted_flows.append(flow_k)
 
+            if sum(discounted_flows) >= 0:
+                break
+
         dpp = PBP(discounted_flows)
+
         if loan and not np.isnan(dpp) and dpp < loan_term:
             dpp = loan_term
+
         return dpp
     except FinancialSimulationError:
         raise
@@ -1398,6 +1619,30 @@ def _log_mu_sigma_from_p10_p50_p90_prices(p10, p50, p90):
     sigma_ln = (np.log(p90) - np.log(p10)) / (2.0 * Z90)
     sigma_ln = np.maximum(sigma_ln, 1e-12)
     return mu_ln, sigma_ln
+
+
+def build_energy_savings_factor_distribution(
+    downside_at_p10: float = 0.30,
+) -> dict[str, float]:
+    """
+    Model energy-savings uncertainty as a multiplicative Normal factor.
+    Assumption: the 10th percentile is `downside_at_p10` below the base savings.
+    Example: downside_at_p10=0.30 => factor P10 = 0.70 and factor P50 = 1.00.
+    """
+    _ensure(0.0 <= downside_at_p10 < 1.0, "downside_at_p10 must be in [0, 1).", FinancialInputError)
+
+    p10 = 1.0 - downside_at_p10
+    p50 = 1.0
+    sigma = max((p50 - p10) / Z90, 1e-12)
+    return {
+        "mu": p50,
+        "sigma": sigma,
+        "p10": p10,
+        "p50": p50,
+        "p90": p50 + (p50 - p10),
+        "dist": "normal",
+        "unit": "factor",
+    }
 
 
 def build_market_distributions(
@@ -1518,11 +1763,19 @@ def get_kpi_results(
     rate = rng.normal(dist_params['loan_rate']['mu'], dist_params['loan_rate']['sigma'], size=(n_sims, T))
     disc = rng.normal(dist_params['discount']['mu'], dist_params['discount']['sigma'], size=(n_sims, T))
     elec = np.exp(rng.normal(dist_params['elec_price']['mu_ln'], dist_params['elec_price']['sigma_ln'], size=(n_sims, T)))
+    energy_savings_factor_dist = build_energy_savings_factor_distribution()
+    energy_savings_factor = rng.normal(
+        energy_savings_factor_dist["mu"],
+        energy_savings_factor_dist["sigma"],
+        size=n_sims,
+    )
 
     infl = np.maximum(infl, -50.0)
     rate = np.maximum(rate, -50.0)
     disc = np.maximum(disc, -0.99)
     elec = np.maximum(elec, 1e-9)
+    energy_savings_factor = np.maximum(energy_savings_factor, 0.0)
+    dist_params["energy_savings"] = energy_savings_factor_dist
 
     results: dict[str, Any] = {}
 
@@ -1537,34 +1790,55 @@ def get_kpi_results(
         pbp = np.full(n_sims, np.nan)
         dpp = np.full(n_sims, np.nan)
         roi = np.full(n_sims, np.nan)
+        total_repayment = np.full(n_sims, np.nan)
+        cashflow_paths = np.full((n_sims, T + 1), np.nan)
+        inflow_paths = np.full((n_sims, T + 1), np.nan)
+        outflow_paths = np.full((n_sims, T + 1), np.nan)
 
         for i in range(n_sims):
             elec_i = elec[i, :].tolist()
             infl_i = infl[i, :].tolist()
             rate_i = rate[i, :].tolist()
             disc_i = float(disc[i, 0])
-
+            base_energy_savings = float(base_inputs["annual_energy_savings"])
+            energy_savings_i = base_energy_savings * float(energy_savings_factor[i])
+            # infl_i = [2 for x in infl_i]
             try:
                 inputs = prepare_cashflow_inputs(
                     base_inputs=base_inputs,
                     electricity_prices=elec_i,
                     inflation_rate=infl_i,
                     loan_interest_rate=rate_i,
+                    annual_energy_savings=energy_savings_i,
                 )
-                flows = cashflow_function(**inputs)
+                flows, inflows, outflows = cashflow_function(**inputs)
                 _validate_flows(flows)
+                _ensure(
+                    isinstance(inflows, list) and isinstance(outflows, list),
+                    f"Cash-flow function for scheme '{scheme_type}' must return list inflows/outflows.",
+                    SimulationComputationError,
+                )
+                _ensure(
+                    len(inflows) == len(flows) == len(outflows),
+                    f"Cash-flow, inflow, and outflow lengths must match for scheme '{scheme_type}'.",
+                    SimulationComputationError,
+                )
                 irr[i] = IRR(flows)
                 npv[i] = NPV(disc_i, flows)
-                if flows[0] == 0:
-                    pbp[i] = 0
-                    dpp[i] = 0
-                elif "term_years" in inputs and inputs["term_years"]:
+                # if flows[0] == 0:
+                #     pbp[i] = 0
+                #     dpp[i] = 0
+                if "term_years" in inputs and inputs["term_years"]:
                     pbp[i] = PBP(flows, loan=True, loan_term=int(inputs["term_years"]))
                     dpp[i] = DPP(disc_i, T, flows, loan=True, loan_term=int(inputs["term_years"]))
                 else:
                     pbp[i] = PBP(flows)
                     dpp[i] = DPP(disc_i, T, flows)
                 roi[i] = ROI(flows)
+                total_repayment[i] = float(np.sum(np.asarray(outflows[1:], dtype=float)))
+                cashflow_paths[i, :] = np.asarray(flows, dtype=float)
+                inflow_paths[i, :] = np.asarray(inflows, dtype=float)
+                outflow_paths[i, :] = np.asarray(outflows, dtype=float)
             except FinancialSimulationError:
                 raise
             except Exception as exc:
@@ -1573,12 +1847,19 @@ def get_kpi_results(
                 ) from exc
 
         censor_value = T + 1
-        pbp_censored = np.where(np.isnan(pbp), censor_value, pbp)
-        dpp_censored = np.where(np.isnan(dpp), censor_value, dpp)
+        pbp_censored = np.where(~np.isfinite(pbp) | (pbp > T), censor_value, pbp)
+        dpp_censored = np.where(~np.isfinite(dpp) | (dpp > T), censor_value, dpp)
 
         def pct(a, qs=(5, 10, 25, 50, 75, 90, 95)):
             a = np.asarray(a, dtype=float)
             return {f"P{q}": np.nanpercentile(a, q) for q in qs}
+
+        def pct_by_year(paths, qs=(5, 10, 25, 50, 75, 90, 95)):
+            arr = np.asarray(paths, dtype=float)
+            return {
+                f"P{q}": np.nanpercentile(arr, q, axis=0).tolist()
+                for q in qs
+            }
 
         disc_target = float(np.nanmedian(disc[:, 0]))
 
@@ -1593,6 +1874,7 @@ def get_kpi_results(
                 "PBP": pct(pbp_censored),
                 "DPP": pct(dpp_censored),
                 "ROI": pct(roi),
+                "total_repayment": pct(total_repayment),
             },
             "probabilities": {
                 "Pr(NPV > 0)": pr(npv > 0),
@@ -1603,9 +1885,32 @@ def get_kpi_results(
             "n_sims": n_sims,
         }
 
+        kpi_histograms = {
+            "NPV": _build_kpi_histogram_payload("NPV", npv),
+            "IRR": _build_kpi_histogram_payload("IRR", irr),
+            "ROI": _build_kpi_histogram_payload("ROI", roi),
+            "PBP": _build_kpi_histogram_payload(
+                "PBP",
+                pbp,
+                project_lifetime=T,
+            ),
+            "DPP": _build_kpi_histogram_payload(
+                "DPP",
+                dpp,
+                project_lifetime=T,
+            ),
+        }
+
         results[scheme_type] = {
             "scheme_id": scheme_def["scheme_id"],
             "summary": summary,
+            "kpi_histograms": kpi_histograms,
+            "cashflow_distributions": {
+                "years": list(range(T + 1)),
+                "cash_flows": pct_by_year(cashflow_paths),
+                "inflows": pct_by_year(inflow_paths),
+                "outflows": pct_by_year(outflow_paths),
+            },
         }
     return results
 

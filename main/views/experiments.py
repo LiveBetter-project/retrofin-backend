@@ -54,7 +54,7 @@ class ExperimentViewSet(viewsets.ModelViewSet):
             return float(v) if v is not None else None
 
         items = []
-        for sr in latest_run.scheme_results.select_related("scheme").all():
+        for sr in latest_run.scheme_results.select_related("scheme").prefetch_related("cashflows").all():
             items.append({
                 "scheme_id": sr.scheme.id,
                 "scheme_type": sr.scheme.scheme_type,
@@ -68,11 +68,27 @@ class ExperimentViewSet(viewsets.ModelViewSet):
                 "dpp_p50": _f(sr.dpp_p50), "dpp_p75":  _f(sr.dpp_p75),  "dpp_p90":  _f(sr.dpp_p90),  "dpp_p95":  _f(sr.dpp_p95),
                 "roi_p5":  _f(sr.roi_p5),  "roi_p10":  _f(sr.roi_p10),  "roi_p25":  _f(sr.roi_p25),
                 "roi_p50": _f(sr.roi_p50), "roi_p75":  _f(sr.roi_p75),  "roi_p90":  _f(sr.roi_p90),  "roi_p95":  _f(sr.roi_p95),
+                "total_repayment_p5":  _f(sr.total_repayment_p5),
+                "total_repayment_p10": _f(sr.total_repayment_p10),
+                "total_repayment_p25": _f(sr.total_repayment_p25),
+                "total_repayment_p50": _f(sr.total_repayment_p50),
+                "total_repayment_p75": _f(sr.total_repayment_p75),
+                "total_repayment_p90": _f(sr.total_repayment_p90),
+                "total_repayment_p95": _f(sr.total_repayment_p95),
                 "pr_npv_positive":        _f(sr.pr_npv_positive),
                 "pr_pbp_within_lifetime": _f(sr.pr_pbp_within_lifetime),
                 "pr_dpp_within_lifetime": _f(sr.pr_dpp_within_lifetime),
+                "kpi_histograms": sr.kpi_histograms,
                 "disc_target_used":       _f(sr.disc_target_used),
                 "n_sims": sr.n_sims,
+                "cashflows": [
+                    {
+                        "year": cf.year,
+                        "inflow": _f(cf.inflow),
+                        "outflow": _f(cf.outflow),
+                    }
+                    for cf in sr.cashflows.all()
+                ],
             })
         return Response({"run_id": latest_run.id, "run_status": latest_run.status, "items": items})
 

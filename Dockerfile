@@ -10,6 +10,7 @@ RUN apt-get update \
        postgresql-server-dev-all gcc python3-dev musl-dev g++ netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
+
 RUN pip install --upgrade pip
 COPY ./requirements.txt .
 RUN pip install -r requirements.txt
