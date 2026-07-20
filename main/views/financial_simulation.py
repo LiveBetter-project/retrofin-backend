@@ -10,9 +10,7 @@ import numpy_financial as npf
 import itertools
 import math
 import matplotlib.pyplot as plt
-import json
 import tempfile
-from pathlib import Path
 from decimal import Decimal
 from django.utils import timezone
 import logging
@@ -197,30 +195,11 @@ def _build_kpi_histogram_payload(
     }
 
 
-def _dump_results_to_temp_json(experiment, run, results: dict) -> Path | None:
-    try:
-        temp_dir = Path("./temp_scheme_results")
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        identifier = f"experiment_{getattr(experiment, 'id', 'unknown')}"
-        if run is not None:
-            identifier += f"_run_{getattr(run, 'id', 'unknown')}"
-        timestamp = timezone.now().strftime("%Y%m%d_%H%M%S_%f")
-        path = temp_dir / f"{identifier}_{timestamp}_scheme_results.json"
-        with path.open("w", encoding="utf-8") as json_file:
-            json.dump(results, json_file, indent=2, default=str, ensure_ascii=False)
-        logger.info("Temporarily saved scheme results to %s", path)
-        return path
-    except Exception as exc:
-        logger.exception("Failed to write temporary scheme results JSON: %s", exc)
-        return None
-
-
 def save_scheme_results(experiment, results: dict, run=None):
     building = experiment.buildings.first()
     if building is None:
         raise ExperimentConfigurationError("Cannot save scheme results because the experiment has no building.")
     _ensure(isinstance(results, dict), f"results must be a dictionary. Got: {type(results).__name__}", ResultPersistenceError)
-    _dump_results_to_temp_json(experiment, run, results)
     cashflow_model = getattr(SchemeResult, "SchemeResultCashflow", None)
 
     saved = []
@@ -1862,7 +1841,7 @@ def get_kpi_results(
     results: dict[str, Any] = {}
 
     for scheme_def in scheme_definitions:
-        print("Running simulations for scheme:", scheme_def["scheme_type"])
+        logger.info("Running simulation for scheme=%s", scheme_def["scheme_type"])
         scheme_type = scheme_def["scheme_type"]
         cashflow_function = scheme_def["cashflow_function"]
         base_inputs = scheme_def["base_inputs"]
@@ -2012,7 +1991,6 @@ def run_experiment(experiment, run):
             run=run,
         )
         logger.info("Scheme results saved for experiment=%s run=%s", getattr(experiment, "id", None), getattr(run, "id", None))
-        logger.info("experiment results are: %s", results)
         run.status = Run.Status.COMPLETED
         run.finished_at = timezone.now()
         run.save(update_fields=["status", "finished_at"])
