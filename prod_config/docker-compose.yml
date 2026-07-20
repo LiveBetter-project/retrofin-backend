@@ -56,7 +56,7 @@ services:
     init: true
     stop_grace_period: 10s
     build: 
-      context: ../../s342_app
+      context: ../../frontend
       dockerfile: Dockerfile
       args:
         REACT_APP_API_URL: /api/
