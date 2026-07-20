@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import path, include
 from rest_framework import routers
 
@@ -37,6 +38,7 @@ router.register(
 )
 
 urlpatterns = [
+    path('health/', lambda request: JsonResponse({'status': 'ok'})),
     path('admin/', admin.site.urls),
     path('api/', include(router.urls)),
 ]

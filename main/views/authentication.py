@@ -16,7 +16,12 @@ User = get_user_model()
 
 class AuthenticationView(viewsets.ViewSet):
 
-    @action(methods=['post'], detail=False, permission_classes=[AllowAny])
+    @action(
+        methods=['post'],
+        detail=False,
+        permission_classes=[AllowAny],
+        authentication_classes=[],
+    )
     def register(self, request):
         serializer = RegisterSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -30,7 +35,12 @@ class AuthenticationView(viewsets.ViewSet):
             'message': 'User registered successfully',
         }, status=status.HTTP_201_CREATED)
 
-    @action(methods=['post'], detail=False, permission_classes=[AllowAny])
+    @action(
+        methods=['post'],
+        detail=False,
+        permission_classes=[AllowAny],
+        authentication_classes=[],
+    )
     def login(self, request):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -54,7 +64,12 @@ class AuthenticationView(viewsets.ViewSet):
             status=status.HTTP_401_UNAUTHORIZED,
         )
 
-    @action(methods=['post'], detail=False, permission_classes=[AllowAny])
+    @action(
+        methods=['post'],
+        detail=False,
+        permission_classes=[AllowAny],
+        authentication_classes=[],
+    )
     def refresh(self, request):
         serializer = RefreshTokenSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)

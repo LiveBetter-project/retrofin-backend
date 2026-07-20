@@ -504,8 +504,10 @@ def cash_flows_green_bond_loan(
     flows = []
     inflows = []
     outflows = []
-
-    flows.append(-(capex - gb_proceeds))
+    cf = -(capex - gb_proceeds)
+    if cf == 0: 
+        cf = -1
+    flows.append(cf)
     inflows.append(gb_proceeds)
     outflows.append(capex)
 
@@ -580,7 +582,10 @@ def cash_flows_green_bond_bullet(
     flows = []
     inflows = []
     outflows = []
-    flows.append(-(capex - gb_proceeds))
+    cf = -(capex - gb_proceeds)
+    if cf == 0: 
+        cf = -1
+    flows.append(cf)
     inflows.append(gb_proceeds)
     outflows.append(capex)
 
@@ -675,13 +680,15 @@ def cash_flows_epc_guaranteed_savings(
             interest = outstanding * (loan_interest_rate[idx] / 100.0)
             D_t = principal + interest
             outstanding -= principal
+            # ESCO compensation
+            if AS_t < gs_t:
+                comp = gs_t - AS_t
+            else:
+                comp = 0.0
         else:
             D_t = 0.0
-        # ESCO compensation
-        if AS_t < gs_t:
-            comp = gs_t - AS_t
-        else:
             comp = 0.0
+
         cf_t = op_cf - D_t + comp
         inflows.append(AS_t + comp)
         outflows.append(om_t + D_t)
@@ -1021,6 +1028,8 @@ def cash_flows_equity_crowdfunding(
         # Year 0
         plat_cost = equity_crowd * fee_plat
         cf0 = equity_crowd - plat_cost - capex
+        if cf0 == 0:
+            cf0=-1
         flows.append(cf0)
         inflows.append(equity_crowd)
         outflows.append(plat_cost + capex)
@@ -1107,7 +1116,7 @@ def cash_flows_with_loan(
             loan_payment = 0.0
             
             if year < term_years and loan_amount > 0:
-                interest_payment = outstanding * (loan_interest_rate[year] / 100.0)
+                interest_payment = outstanding * (3.5 / 100.0)
                 loan_payment = constant_principal_payment + interest_payment
                 outstanding -= constant_principal_payment  
             
@@ -1118,6 +1127,79 @@ def cash_flows_with_loan(
         return flows, inflows, outflows
     except Exception as exc:
         raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
+
+# def cash_flows_with_loan(
+#     capex: float,
+#     annual_energy_savings: float,
+#     annual_maintenace_cost: float,
+#     project_lifetime: int,
+#     electricity_prices: list[float],
+#     inflation_rate: list[float],
+#     loan_amount: float,
+#     loan_interest_rate: list[float],
+#     term_years: int,
+# ) -> tuple[list[float], list[float], list[float]]:
+#     """Compute the yearly net cash-flow profile **including** debt service.
+
+#     Parameters
+#     ----------
+#     capex : float
+#         Up-front capital expenditure (positive number). The function treats this as
+#         an *outflow* at *t = 0*.
+#     annual_energy_savings : float
+#         Nominal number of kWh saved per year.
+#     annual_maintenace_cost : float
+#         Nominal yearly O&M cost in today's money.
+#     project_lifetime : int
+#         Evaluation horizon in *years* (must be at least 1).
+#     electricity_prices : list[float]
+#         Forecast grid prices for each year **indexed the same as `inflation_rate`**.
+#     inflation_rate : list[float]
+#         Inflation rates for each year (indexed the same as `electricity_prices`).
+#     loan_amount : float
+#         Principal borrowed at *t = 0*.
+#     loan_interest_rate : list[float]
+#         Annual interest rate applicable **per remaining principal**.
+#     term_years : int
+#         Term of loan in *years* (must be at least 1).
+#     Returns
+#     -------
+#     list[float]
+#         Sequence of net cash-flows (index 0 … ``project_lifetime``).  The first
+#         element is *negative* (the equity outflow) and subsequent entries may be
+#         positive or negative depending on operating surplus and debt service.
+#     """
+#     try:
+#         flows = []
+#         inflows = []
+#         outflows = []
+        
+#         # capex minus the loan received
+#         flows.append(-(capex-loan_amount))
+#         inflows.append(loan_amount)
+#         outflows.append(capex)
+        
+#         outstanding = loan_amount
+#         constant_principal_payment = loan_amount / term_years if term_years > 0 else 0.0
+#         cumulative_infl = 1.0
+
+#         for year in range(0, project_lifetime):
+#             cumulative_infl *= (1 + inflation_rate[year]/100.0)
+#             operating_cf = annual_energy_savings * electricity_prices[year] - annual_maintenace_cost * cumulative_infl
+#             loan_payment = 0.0
+            
+#             if year < term_years and loan_amount > 0:
+#                 interest_payment = outstanding * (loan_interest_rate[year] / 100.0)
+#                 loan_payment = constant_principal_payment + interest_payment
+#                 outstanding -= constant_principal_payment  
+            
+#             inflows.append(annual_energy_savings * electricity_prices[year])
+#             outflows.append(annual_maintenace_cost * cumulative_infl + loan_payment)
+#             flows.append(operating_cf - loan_payment)
+        
+#         return flows, inflows, outflows
+#     except Exception as exc:
+#         raise SimulationComputationError(f"Cash-flow computation failed: {exc}") from exc
 
 def cash_flows(
     capex: float,

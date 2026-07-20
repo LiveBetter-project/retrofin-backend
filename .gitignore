@@ -1,1 +1,5 @@
 notes/
+prod_config/.env.prod
+staticfiles/
+__pycache__/
+*.py[cod]

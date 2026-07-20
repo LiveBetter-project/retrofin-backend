@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env*
+prod_config/.env.prod
+__pycache__
+*.py[cod]
+staticfiles
+temp_scheme_results
+notes

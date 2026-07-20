@@ -1,0 +1,83 @@
+services:
+  s342_backend:
+    container_name: s342_backend
+    restart: always
+    init: true
+    stop_grace_period: 30s
+    expose:
+      - "8010"
+    env_file:
+      - ./.env.prod
+    build:
+      context: ..
+    command: gunicorn --bind 0.0.0.0:8010 --workers 3 --timeout 120 --graceful-timeout 30 --max-requests 1000 --max-requests-jitter 100 --access-logfile - --error-logfile - s342_backend.wsgi:application
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - default
+      - webproxy
+
+  db:
+    image: postgres:15
+    container_name: s342_db
+    restart: always
+    stop_grace_period: 60s
+    volumes:
+      - postgr_data:/var/lib/postgresql/data/
+    env_file:
+      - ./.env.prod
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  s342_frontend:
+    container_name: s342_frontend
+    restart: always
+    init: true
+    stop_grace_period: 10s
+    build: 
+      context: ../../s342_app
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: /api/
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - webproxy
+volumes:
+  postgr_data:
+
+networks:
+  webproxy:
+    external: true
