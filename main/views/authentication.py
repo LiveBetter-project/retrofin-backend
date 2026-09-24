@@ -1,3 +1,5 @@
+import logging
+
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -12,6 +14,7 @@ from main.serializers import (
 )
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class AuthenticationView(viewsets.ViewSet):
@@ -24,7 +27,17 @@ class AuthenticationView(viewsets.ViewSet):
     )
     def register(self, request):
         serializer = RegisterSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
+        if not serializer.is_valid():
+            # Log why registration failed, without the passwords.
+            safe_data = {
+                k: v for k, v in request.data.items()
+                if k not in ('password', 'password2')
+            }
+            logger.warning("REGISTER DATA: %s", safe_data)
+            logger.warning("REGISTER ERRORS: %s", serializer.errors)
+            # Raising keeps the response in the shared
+            # {"error": {"code", "message", "details"}} format (see main/exceptions.py).
+            serializer.is_valid(raise_exception=True)
         user = serializer.save()
 
         refresh = RefreshToken.for_user(user)
